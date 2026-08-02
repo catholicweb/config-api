@@ -1,0 +1,30 @@
+# https://developers.cloudflare.com/workers/wrangler/configuration/
+name = "parroquia-config-api"
+main = "src/index.js"
+compatibility_date = "2026-07-14"
+workers_dev = false
+
+# Public endpoint: https://api.parroquia.app — the custom domain is bound to
+# this Worker in the Cloudflare dashboard. This API token lacks Zone ->
+# Workers Routes / DNS edit permission, so the route is managed there, not here.
+# (Putting it in `routes` below makes `wrangler deploy` fail with auth error 10000.)
+
+# Single R2 bucket. Everything lives here:
+#   npx wrangler r2 bucket create parroquia
+#
+#   auth.json                 — top-level credential map { "<sha256(token)>": "<slug>" }
+#   <slug>/<token>            — a file (token = base64url of local path)
+# Exposed in the Worker as env.CONTENT.
+#
+# Secrets required for site creation (POST /sites/:slug) — set with wrangler secret put:
+#
+#   npx wrangler secret put ADMIN_TOKEN_HASH        # sha256 hex of your admin token
+#   npx wrangler secret put CLOUDFLARE_API_TOKEN    # API token with Zone.DNS:Edit + Account.Pages:Edit
+#   npx wrangler secret put CLOUDFLARE_ACCOUNT_ID   # Cloudflare account ID
+#   npx wrangler secret put CLOUDFLARE_ZONE_ID      # Zone ID for parroquia.app
+#
+# For local dev, put them in .dev.vars instead (gitignored).
+
+[[r2_buckets]]
+binding = "CONTENT"
+bucket_name = "parroquia"
