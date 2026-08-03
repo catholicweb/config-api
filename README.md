@@ -39,8 +39,10 @@ the code ever disagree, **the code wins** and this README must be corrected.
 |--------|--------------------------|-----------------|----------------------------------------------------|----------|
 | GET    | `/health`                | —               | —                                                  | `200 { ok, bindings }` / `503` |
 | GET    | `/whoami`                | `Bearer editor` | —                                                  | `200 { slug }` / `401` / `403` |
-| GET    | `/sites/list`            | —               | —                                                  | `200 { slugs: [...] }` |
-| GET    | `/sites/:slug/list`      | —               | `:slug` validated (see slug rules)                 | `200 { slug, files: [...] }` / `400` |
+| GET    | `/sites`                 | —               | —                                                  | `200 { slugs: [...] }` |
+| GET    | `/sites/:slug`           | —               | `:slug` validated (see slug rules)                 | `200 { slug, files: [...] }` / `400` |
+| GET    | `/sites/list`            | —               | —                                                  | `200 { slugs: [...] }` *(legacy alias of `/sites`)* |
+| GET    | `/sites/:slug/list`      | —               | `:slug` validated (see slug rules)                 | `200 { slug, files: [...] }` / `400` *(legacy alias of `/sites/:slug`)* |
 | POST   | `/sites/:slug`           | `Bearer admin`  | `:slug` validated, not reserved                    | `201 { ok, slug, token }` / `400/401/403/409/503` |
 | PUT    | `/sites/:slug/:token`    | `Bearer editor` | body = raw bytes, `Content-Type` optional          | `200 { ok, slug, key }` / `400/401/403` |
 | DELETE | `/sites/:slug/:token`    | `Bearer editor` | —                                                  | `200 { ok, slug, key }` / `400/401/403` |
@@ -60,8 +62,9 @@ curl https://api.parroquia.app/health
 curl -H "Authorization: Bearer <EDITOR_TOKEN>" https://api.parroquia.app/whoami
 
 # List all slugs / list files under a slug
-curl https://api.parroquia.app/sites/list
-curl https://api.parroquia.app/sites/<slug>/list
+curl https://api.parroquia.app/sites
+curl https://api.parroquia.app/sites/<slug>
+# Legacy aliases still work: /sites/list and /sites/<slug>/list
 
 # Create a site (admin only) — mints a 256-bit editor token, provisions Cloudflare
 curl -X POST -H "Authorization: Bearer <ADMIN_TOKEN>" https://api.parroquia.app/sites/<slug>

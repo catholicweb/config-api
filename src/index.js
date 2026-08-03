@@ -42,8 +42,11 @@
  * impossible through the filename rules themselves.
  *
  * READ (no auth):
- *   GET  /sites/list               — list all slugs (top-level "folders" in CONTENT)
- *   GET  /sites/:slug/list         — list all filenames under a slug
+ *   GET  /sites                    — list all slugs (top-level "folders" in CONTENT)
+ *   GET  /sites/:slug              — list all filenames under a slug
+ *   Legacy aliases (kept for backward compatibility):
+ *   GET  /sites/list               — same as GET /sites
+ *   GET  /sites/:slug/list         — same as GET /sites/:slug
  *
  * SITE CREATION (gated by an admin secret — see authorizeAdmin):
  *   POST /sites/:slug               — create a site, mint a 256-bit editor token,
@@ -125,12 +128,21 @@ export default {
       return new Response('Not Found', { status: 404 });
     }
 
-    // GET /sites/list
-    if (method === 'GET' && segments.length === 2 && segments[1] === 'list') {
+    // GET /sites — list all slugs
+    if (method === 'GET' && segments.length === 1) {
       return listSlugs(env);
     }
 
-    // GET /sites/:slug/list
+    // GET /sites/:slug — list all filenames under a slug
+    if (method === 'GET' && segments.length === 2) {
+      // Legacy alias: GET /sites/list (was the old "list all slugs" route)
+      if (segments[1] === 'list') return listSlugs(env);
+      const slug = segments[1];
+      if (!validateSlug(slug)) return new Response('Invalid slug', { status: 400 });
+      return listFiles(env, slug);
+    }
+
+    // Legacy alias: GET /sites/:slug/list (was the old "list files" route)
     if (method === 'GET' && segments.length === 3 && segments[2] === 'list') {
       const slug = segments[1];
       if (!validateSlug(slug)) return new Response('Invalid slug', { status: 400 });
