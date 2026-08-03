@@ -1,13 +1,13 @@
 /**
  * ⚠️⚠️⚠️ CRITICAL INTER-DEPENDENCY WARNING ⚠️⚠️⚠️
  *
- * This file's token encoding and API endpoints are DEPENDED UPON by:
- *   - editor/docs/.vitepress/theme/lib/codec.js (token encoding)
+ * This file's filename validation and API endpoints are DEPENDED UPON by:
+ *   - editor/docs/.vitepress/theme/lib/codec.js (filename encoding)
  *   - editor/docs/.vitepress/theme/lib/api.js (API client)
  *   - web-template/docs/.vitepress/migrate.js (sync script)
  *
  * BEFORE making changes:
- * 1. Token charset (TOKEN_RE) MUST match codec.js and migrate.js
+ * 1. Filename validation (FILENAME_RE, ALLOWED_EXT, validateFilename) MUST match codec.js and migrate.js
  * 2. API endpoints MUST be compatible with api.js and migrate.js
  * 3. R2 storage format MUST be compatible with migrate.js
  *
@@ -21,17 +21,23 @@
  *
  *   auth.json                — top-level credential map: { "<sha256(token)>": "<slug>" }
  *   <slug>/.site             — per-slug existence marker (created on site creation)
- *   <slug>/<token>           — a file, where <token> is an OPAQUE base64url string
+ *   <slug>/<filename>        — a file, where <filename> is a validated human-readable name
  *
- * File keys are opaque tokens, not paths. The migrate script encodes the local
- * relative path to a base64url token on upload and decodes it back on download.
- * The server NEVER decodes a token — it stores and serves it verbatim. This
- * makes path traversal structurally impossible on the server: the token charset
- * has no `/`, `.`, `\`, or control bytes, so no token can express a traversal.
+ * File keys are validated filenames (not opaque tokens). The client encodes local
+ * paths to flat filenames by replacing / with - and sanitizing extensions. The
+ * server validates filenames but NEVER interprets them as paths — they are used
+ * verbatim as R2 keys. Security comes from the filename validation rules:
+ *   - Base charset [A-Za-z0-9_-] (intentionally identical to base64url alphabet)
+ *   - At most one trailing dot with an allowlisted extension
+ *   - No leading hyphen (CLI arg injection guard)
+ *   - Max 255 chars (filesystem limit)
+ *
+ * This makes path traversal, hidden files, and extension spoofing structurally
+ * impossible through the filename rules themselves.
  *
  * READ (no auth):
  *   GET  /sites/list               — list all slugs (top-level "folders" in CONTENT)
- *   GET  /sites/:slug/list         — list all file tokens under a slug
+ *   GET  /sites/:slug/list         — list all filenames under a slug
  *
  * SITE CREATION (gated by an admin secret — see authorizeAdmin):
  *   POST /sites/:slug               — create a site, mint a 256-bit editor token,
@@ -43,8 +49,8 @@
  *                                      Rejects reserved slugs: api, editor, www, data
  *
  * WRITE (editor bearer token required):
- *   PUT    /sites/:slug/:token      — overwrite a file (token = base64url of local path)
- *   DELETE /sites/:slug/:token      — delete a file
+ *   PUT    /sites/:slug/:filename   — overwrite a file (filename = validated human-readable name)
+ *   DELETE /sites/:slug/:filename   — delete a file
  *
  * Two distinct capabilities:
  *   - ADMIN_TOKEN_HASH (Worker secret, never in the bucket): gates site creation.
@@ -57,11 +63,11 @@
  * authorized only if the hash exists AND its mapped slug equals the slug in the
  * URL path. Tokens are 256-bit random values, so their SHA-256 hashes are not
  * brute-forceable. The credential map lives at the bucket root; every content
- * key is `<slug>/<token>` with a no-slash token, so no content key can reach it.
+ * key is `<slug>/<filename>` with a validated filename, so no content key can reach it.
  *
- * CRITICAL INVARIANT: the server must never decode a token into a path. It is
- * used verbatim as the R2 key. All path semantics live in migrate.js. If a
- * future change decodes tokens server-side, the traversal safety evaporates.
+ * CRITICAL INVARIANT: the server must never interpret a filename as a path. It is
+ * used verbatim as the R2 key. All path semantics live in the client. If a
+ * future change interprets filenames server-side, the traversal safety evaporates.
  */
 
 export default {
@@ -182,19 +188,39 @@ const SLUG_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 // existing DNS records or planned service endpoints under parroquia.app.
 const RESERVED_SLUGS = new Set(['api', 'editor', 'www', 'data']);
 
-// Token = the base64url alphabet (unpadded): letters, digits, `-`, `_`.
-// No `/`, `.`, `\`, control, or any path-separator char can appear, so a token
-// is structurally incapable of expressing a path traversal. We REJECT any
-// out-of-charset input (never strip) — stripping can collide distinct inputs
-// and silently remap malicious payloads into valid keys.
-const TOKEN_RE = /^[A-Za-z0-9_-]+$/;
+// Allowed file extensions for uploaded content. Only these extensions are
+// permitted after the single trailing dot in a filename.
+const ALLOWED_EXT = ['md', 'jpg', 'jpeg', 'png', 'gif', 'webp', 'pdf', 'json'];
+
+// Filename validation: base64url-compatible base name, plus one optional
+// allowlisted extension. The base charset [A-Za-z0-9_-] is intentionally
+// identical to the base64url alphabet for backward compatibility with existing
+// tokens. Dots are only permitted as a single trailing extension separator.
+// This makes path traversal (..), hidden files (.env), and extension spoofing
+// (file.jpg.exe) structurally impossible.
+const FILENAME_RE = /^[A-Za-z0-9_-]+(\.[a-z0-9]{1,5})?$/;
+
+function validateFilename(filename) {
+  if (!filename || typeof filename !== 'string') return false;
+  if (filename.length > 255) return false;          // filesystem limit
+  if (filename.startsWith('-')) return false;        // CLI arg injection guard
+  if (!FILENAME_RE.test(filename)) return false;
+
+  // Extension check (if present)
+  const dotIndex = filename.lastIndexOf('.');
+  if (dotIndex !== -1) {
+    const ext = filename.slice(dotIndex + 1).toLowerCase();
+    if (!ALLOWED_EXT.includes(ext)) return false;
+  }
+  return true;
+}
 
 function validateSlug(slug) {
   return typeof slug === 'string' && SLUG_RE.test(slug);
 }
 
 function validateToken(token) {
-  return typeof token === 'string' && TOKEN_RE.test(token);
+  return validateFilename(token);
 }
 
 function validateSlugNotReserved(slug) {
