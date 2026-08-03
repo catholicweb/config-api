@@ -11,7 +11,13 @@
  * 2. API endpoints MUST be compatible with api.js and migrate.js
  * 3. R2 storage format MUST be compatible with migrate.js
  *
- * See ../CLAUDE.md for full dependency documentation.
+ * The authoritative contract (endpoints, token encoding, R2 layout, and the
+ * consumer files that must stay in sync) is documented in ./README.md
+ * (and at https://github.com/catholicweb/config-api/blob/main/README.md).
+ * This file remains the authoritative source for runtime BEHAVIOR — if the
+ * README and this file ever disagree, this file wins and the README must be
+ * corrected. Do not change FILENAME_RE/ALLOWED_EXT/routes without updating
+ * codec.js, api.js, and migrate.js.
  */
 
 /**

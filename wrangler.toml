@@ -13,7 +13,8 @@ workers_dev = false
 #   npx wrangler r2 bucket create parroquia
 #
 #   auth.json                 — top-level credential map { "<sha256(token)>": "<slug>" }
-#   <slug>/<token>            — a file (token = base64url of local path)
+#   <slug>/<token>            — a file (token = flat URL-safe filename; clients encode
+#                               local paths by replacing / with -; see README.md)
 # Exposed in the Worker as env.CONTENT.
 #
 # Secrets required for site creation (POST /sites/:slug) — set with wrangler secret put:
