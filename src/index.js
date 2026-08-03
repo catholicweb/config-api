@@ -27,7 +27,7 @@
  * paths to flat filenames by replacing / with - and sanitizing extensions. The
  * server validates filenames but NEVER interprets them as paths — they are used
  * verbatim as R2 keys. Security comes from the filename validation rules:
- *   - Base charset [A-Za-z0-9_-] (intentionally identical to base64url alphabet)
+ *   - Base charset [A-Za-z0-9_-] (the URL-safe filename alphabet)
  *   - At most one trailing dot with an allowlisted extension
  *   - No leading hyphen (CLI arg injection guard)
  *   - Max 255 chars (filesystem limit)
@@ -192,10 +192,10 @@ const RESERVED_SLUGS = new Set(['api', 'editor', 'www', 'data']);
 // permitted after the single trailing dot in a filename.
 const ALLOWED_EXT = ['md', 'jpg', 'jpeg', 'png', 'gif', 'webp', 'pdf', 'json'];
 
-// Filename validation: base64url-compatible base name, plus one optional
-// allowlisted extension. The base charset [A-Za-z0-9_-] is intentionally
-// identical to the base64url alphabet for backward compatibility with existing
-// tokens. Dots are only permitted as a single trailing extension separator.
+// Filename validation: a URL-safe base name, plus one optional allowlisted
+// extension. The base charset [A-Za-z0-9_-] is used for backward compatibility
+// with existing tokens. Dots are only permitted as a single trailing extension
+// separator.
 // This makes path traversal (..), hidden files (.env), and extension spoofing
 // (file.jpg.exe) structurally impossible.
 const FILENAME_RE = /^[A-Za-z0-9_-]+(\.[a-z0-9]{1,5})?$/;
