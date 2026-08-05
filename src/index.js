@@ -195,11 +195,27 @@ export default {
       return createSite(env, slug, email);
     }
 
-    // POST /sites/:slug/magic — invite an additional editor to an existing slug
+    // POST /sites/:slug/magic — issue a magic login link to an existing slug.
+    // Open to all (no admin/editor required): issuing a link does not grant
+    // access, which is still gated by the emails.json grant checked at authorize
+    // after the code is redeemed.
     if (method === 'POST' && segments.length === 3 && segments[2] === 'magic') {
-      const admin = await authorizeAdmin(env, request);
-      if (!admin.ok) return Response.json({ error: admin.error }, { status: admin.status });
-      return inviteEditorMagic(env, request, segments[1]);
+      return loginMagic(env, request, segments[1]);
+    }
+
+    // POST /sites/:slug/editors — grant an email editor access to an existing
+    // slug and email them an invite/login link. Editor-gated: write permission
+    // to the slug is enough to add new editor emails (they can already do
+    // unbounded damage to the repo, so there is no bigger harm in letting them
+    // onboard co-editors).
+    if (method === 'POST' && segments.length === 3 && segments[2] === 'editors') {
+      const slug = segments[1];
+      if (!validateSlug(slug)) return new Response('Invalid slug', { status: 400 });
+
+      const auth = await authorize(env, slug, request);
+      if (!auth.ok) return Response.json({ error: auth.error }, { status: auth.status });
+
+      return addEditor(env, request, slug);
     }
 
     // PUT /sites/:slug/:token — write a file (editor-authed)
@@ -433,8 +449,14 @@ async function readAuthMap(env) {
 
 /**
  * Authorize an editor request for `slug`. The bearer token is SHA-256 hashed
- * and must be present in auth.json AND mapped to this slug. Iterates all
+ * and must be present in auth.json, mapped to this slug, AND (for email-bound
+ * tokens) have its email listed in the slug's emails.json grant. Iterates all
  * entries (no early break) to avoid leaking which hash matched.
+ *
+ * Legacy auth.json entries (plain `tokenHash → "slug"` strings, minted before
+ * tokens were bound to an email) are grandfathered: they pass the plain slug
+ * check with no email requirement. They only lose that status once the holder
+ * re-logs in via magic and gets an email-bound token.
  */
 async function authorize(env, slug, request) {
   const token = bearerToken(request);
@@ -444,15 +466,39 @@ async function authorize(env, slug, request) {
   const map = await readAuthMap(env);
   if (!map) return { ok: false, status: 401, error: 'no auth configured' };
 
-  let ok = false;
-  for (const [hash, validSlug] of Object.entries(map)) {
+  let entry = null;
+  for (const [hash, value] of Object.entries(map)) {
     if (typeof hash === 'string' && timingSafeEqual(hash, tokenHash)) {
-      if (validSlug === slug) ok = true;
+      entry = value;
     }
   }
-  return ok
-    ? { ok: true }
-    : { ok: false, status: 403, error: 'token not valid for this slug' };
+  if (entry == null) {
+    return { ok: false, status: 403, error: 'token not valid for this slug' };
+  }
+
+  // Legacy string entry (token → slug, no bound email): keep the old behavior.
+  if (typeof entry === 'string') {
+    return entry === slug
+      ? { ok: true }
+      : { ok: false, status: 403, error: 'token not valid for this slug' };
+  }
+
+  // Email-bound entry: { slug, emailHash }.
+  if (!entry || entry.slug !== slug) {
+    return { ok: false, status: 403, error: 'token not valid for this slug' };
+  }
+  if (!entry.emailHash) {
+    return { ok: false, status: 403, error: 'token has no bound email' };
+  }
+
+  const grants = await readJsonMap(env, 'emails.json');
+  const list = grants && Array.isArray(grants[entry.emailHash])
+    ? grants[entry.emailHash]
+    : [];
+  if (!list.includes(slug)) {
+    return { ok: false, status: 403, error: 'email not authorized for this slug' };
+  }
+  return { ok: true };
 }
 
 // slug-agnostic version of the same lookup authorize() does.
@@ -465,9 +511,10 @@ async function whoami(env, request) {
   if (!map) return Response.json({ error: 'no auth configured' }, { status: 401 });
 
   let slug = null;
-  for (const [hash, validSlug] of Object.entries(map)) {
+  for (const [hash, value] of Object.entries(map)) {
     if (typeof hash === 'string' && timingSafeEqual(hash, tokenHash)) {
-      slug = validSlug;
+      // New entries are { slug, emailHash }; legacy entries are plain strings.
+      slug = typeof value === 'string' ? value : (value && value.slug) || null;
     }
   }
   if (!slug) return Response.json({ error: 'invalid token' }, { status: 403 });
@@ -626,8 +673,9 @@ async function addEmailGrant(env, emailHash, slug) {
  * Create a site and kick off magic-link login for the site owner.
  *
  * Provisions Cloudflare resources (Pages project, DNS CNAME, custom domain) —
- * idempotent, unchanged from before — then registers a one-time magic code in
- * magic.json and emails the owner a magic link instead of returning a token.
+ * idempotent, unchanged from before — then seeds the site: copies the root
+ * config.json template into <slug>/config.json, grants the owner edit access in
+ * emails.json, and emails them a magic login link instead of returning a token.
  * The email only arrives after provisioning succeeds; if delivery fails, the
  * just-created magic record is rolled back so a retry of this POST is clean
  * (the slug has no marker yet and is not yet listed).
@@ -677,8 +725,28 @@ async function createSite(env, slug, email) {
     );
   }
 
-  // Mint a one-time magic code and email the owner the link. Nothing secret is
-  // stored in the (public) bucket.
+  // Seed the site's config.json from the root template. This is the default
+  // content the site starts with; the editor then edits it as any other file.
+  // The template lives at the bucket root (a separate key from each site's
+  // <slug>/config.json), so it is never served under a slug prefix.
+  const template = await env.CONTENT.get('config.json');
+  if (!template) {
+    return Response.json(
+      { ok: false, error: 'site template config.json not configured at bucket root' },
+      { status: 503 },
+    );
+  }
+  const templateText = await template.text();
+  await env.CONTENT.put(`${slug}/config.json`, templateText, {
+    httpMetadata: { contentType: 'application/json' },
+  });
+
+  // Grant the owner editor access (emails.json is the private, enforced
+  // allowlist) and email them their first login link. Nothing secret is stored
+  // in the (public) bucket.
+  const emailHash = await hmacSha256Hex(env.EMAIL_HASH_SECRET, normalizeEmail(email));
+  await addEmailGrant(env, emailHash, slug);
+
   const issued = await issueMagicLink(env, slug, email);
   if (!issued.ok) {
     return Response.json({ ok: false, error: issued.error }, { status: issued.status });
@@ -698,9 +766,11 @@ async function createSite(env, slug, email) {
 }
 
 /**
- * Mint a one-time magic code for `slug`, email it to `email`, and record the
- * email→slug grant. Shared by site creation and by inviting an editor to an
- * existing slug. Returns { ok:true } or { ok:false, status, error }.
+ * Mint a one-time magic code for `slug` and email the login link to `email`.
+ * This ONLY issues a login link — it does NOT grant the address access. Whether
+ * the redeemed token can write is decided later by `authorize` against the
+ * emails.json grant, which is seeded by `createSite` and added via
+ * `POST /sites/:slug/editors`. Returns { ok:true } or { ok:false, status, error }.
  *
  * The code is stored only as its SHA-256 (the bucket is public); it is
  * single-use and expires after MAGIC_TTL_MS. If email delivery fails, the
@@ -731,16 +801,17 @@ async function issueMagicLink(env, slug, email) {
     return { ok: false, status: 502, error: `failed to send magic-link email: ${sent.error}` };
   }
 
-  await addEmailGrant(env, emailHash, slug);
   return { ok: true };
 }
 
 /**
- * POST /sites/:slug/magic — invite an editor (by email) to an EXISTING slug,
- * emailing them a one-time magic link. Admin-gated: the admin chooses who can
- * edit. No Cloudflare provisioning or slug creation happens here.
+ * POST /sites/:slug/magic — email a one-time magic login link to `email` for an
+ * EXISTING slug. Open to all: this only issues a login link and does NOT grant
+ * access. The address must already be in the slug's emails.json allowlist for
+ * the redeemed token to actually be able to write. No Cloudflare provisioning
+ * or slug creation happens here.
  */
-async function inviteEditorMagic(env, request, slug) {
+async function loginMagic(env, request, slug) {
   if (!validateSlug(slug)) return Response.json({ error: 'invalid slug' }, { status: 400 });
   if (!(await siteExists(env, slug))) {
     return Response.json({ error: 'slug not found' }, { status: 404 });
@@ -752,6 +823,36 @@ async function inviteEditorMagic(env, request, slug) {
   if (!validateEmail(email)) {
     return Response.json({ error: 'a valid email is required' }, { status: 400 });
   }
+
+  const issued = await issueMagicLink(env, slug, email);
+  if (!issued.ok) {
+    return Response.json({ ok: false, error: issued.error }, { status: issued.status });
+  }
+  return Response.json({ ok: true, slug, sent: true, email }, { status: 200 });
+}
+
+/**
+ * POST /sites/:slug/editors — grant `email` edit access to an EXISTING slug and
+ * email them an invite/login link. Editor-gated (the router authorizes first):
+ * write permission to the slug is enough to add new co-editors, since a writer
+ * can already do unbounded damage to the repo. The grant is recorded privately
+ * in emails.json (HMAC-keyed, bucket root — never served publicly) rather than
+ * in the public config.json, so editor emails stay out of the public data host.
+ */
+async function addEditor(env, request, slug) {
+  if (!(await siteExists(env, slug))) {
+    return Response.json({ error: 'slug not found' }, { status: 404 });
+  }
+
+  const body = await readJsonBody(request);
+  if (!body.ok) return Response.json({ error: body.error }, { status: 400 });
+  const email = body.data.email;
+  if (!validateEmail(email)) {
+    return Response.json({ error: 'a valid email is required' }, { status: 400 });
+  }
+
+  const emailHash = await hmacSha256Hex(env.EMAIL_HASH_SECRET, normalizeEmail(email));
+  await addEmailGrant(env, emailHash, slug);
 
   const issued = await issueMagicLink(env, slug, email);
   if (!issued.ok) {
@@ -810,8 +911,10 @@ async function sendMagicLinkEmail(env, email, slug, code) {
  * Proves possession of the emailed link (the code is single-use and expires).
  *
  * Reads magic.json, finds the code by its SHA-256, checks expiry, then mints a
- * 256-bit editor token (sha256 stored in auth.json → slug), removes the code
- * from magic.json (one-time invalidation), and returns the token once.
+ * 256-bit editor token (sha256 stored in auth.json → { slug, emailHash }, where
+ * emailHash is the grant keyed identity of the person who redeemed the link),
+ * removes the code from magic.json (one-time invalidation), and returns the
+ * token once.
  */
 async function exchangeMagic(env, request) {
   const body = await readJsonBody(request);
@@ -846,7 +949,7 @@ async function exchangeMagic(env, request) {
   const tokenHash = await sha256Hex(token);
 
   const map = (await readAuthMap(env)) || {};
-  map[tokenHash] = slug;
+  map[tokenHash] = { slug, emailHash: record.emailHash };
   await writeJsonMap(env, 'auth.json', map);
 
   return Response.json({ ok: true, slug, token }, { status: 200 });
