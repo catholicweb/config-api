@@ -30,6 +30,9 @@ workers_dev = false
 #
 #   npx wrangler secret put RESEND_API_KEY          # API key for the email provider
 #   npx wrangler secret put FROM_EMAIL              # verified sender address (default no-reply@parroquia.app)
+#   npx wrangler secret put EMAIL_HASH_SECRET       # 256-bit (>=32 random bytes, hex/base64) key that
+#                                                   # keyed-hashes emails in emails.json — the bucket is
+#                                                   # public, so plain-sha256 emails would be brute-forceable
 #
 # For local dev, put them in .dev.vars instead (gitignored).
 

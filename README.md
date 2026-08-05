@@ -131,8 +131,10 @@ and kicks off magic-link login instead:
 **Security notes:** the R2 bucket is **public**, so nothing secret ever lives in it.
 Magic codes are stored only as one-way SHA-256 hashes and are single-use + expiring.
 Email addresses are likewise **not stored in plaintext** — `emails.json` is keyed by
-`sha256(trim(lower(email)))`; the real address only travels in the outbound email.
-Editor tokens are 256-bit random values whose hashes are not brute-forceable.
+`hmac-sha256(EMAIL_HASH_SECRET, trim(lower(email)))`. A *plain* sha256 of an email
+would be trivially brute-forceable (small input space), so the digest is **keyed**
+with the `EMAIL_HASH_SECRET` secret; the real address only travels in the outbound
+email. Editor tokens are 256-bit random values whose hashes are not brute-forceable.
 
 ## Token encoding
 
@@ -162,7 +164,7 @@ decodes them back to paths. All path semantics live in the client.
 ```
 auth.json                 { "<sha256(token)>": "<slug>" }
 magic.json                { "<sha256(code)>": { "slug", "emailHash", "exp" } }   pending one-time magic links
-emails.json               { "<sha256(email)>": ["<slug>", ...] }                 email → slug edit grants
+emails.json               { "<hmac-sha256(email)>": ["<slug>", ...] }           email → slug edit grants (keyed)
 <slug>/.site              existence marker (outside token charset, un-writable by clients)
 <slug>/<filename>         content file (validated flat filename)
 slugs.json                { "slugs": [...] }  written on site creation
@@ -207,7 +209,8 @@ npx wrangler deploy
 Required secrets (set via `wrangler secret put`): `ADMIN_TOKEN_HASH`,
 `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_ZONE_ID`,
 `RESEND_API_KEY` (email delivery), `FROM_EMAIL` (verified sender; defaults to
-`no-reply@parroquia.app`). Optional non-secret var: `MAGIC_LINK_BASE` (default
+`no-reply@parroquia.app`), `EMAIL_HASH_SECRET` (≥32 random bytes — keyed-hashes
+emails in `emails.json`). Optional non-secret var: `MAGIC_LINK_BASE` (default
 `https://editor.parroquia.app/magic`). For local dev, put them in gitignored
 `.dev.vars`. See `wrangler.toml` comments.
 

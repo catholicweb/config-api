@@ -69,10 +69,10 @@
  *     gate writes AND reads for that slug only. Tokens are minted via the magic-link
  *     exchange (POST /auth/magic), not returned directly at site creation.
  *
- * MAGIC-LINK + EMAIL CAPABILITY STORE (all hashed — the bucket is PUBLIC, so no
- * secrets or plaintext emails ever live in it):
+ * MAGIC-LINK + EMAIL CAPABILITY STORE (all keyed-hashed — the bucket is PUBLIC,
+ * so no secrets or plaintext emails ever live in it):
  *   magic.json   { "<sha256(code)>": { "slug", "emailHash", "exp" } }   pending one-time codes
- *   emails.json  { "<sha256(email)>": ["<slug>", ...] }                 which emails can edit which slugs
+ *   emails.json  { "<hmac-sha256(email)>": ["<slug>", ...] }            email→slug grants (keyed by EMAIL_HASH_SECRET)
  *
  * Editor auth: the incoming bearer token is SHA-256 hashed and looked up in the
  * top-level `auth.json` object (`{ "<hash>": "<slug>" }`). The request is
@@ -289,6 +289,22 @@ async function sha256Hex(text) {
   let hex = '';
   for (const b of bytes) hex += b.toString(16).padStart(2, '0');
   return hex;
+}
+
+// Keyed HMAC-SHA256 of a value. Used to hash email addresses for emails.json:
+// the bucket is public, and a *plain* sha256 of an email is trivially
+// brute-forceable (small input space). Keying with EMAIL_HASH_SECRET makes the
+// stored digests un-reversible without the secret.
+async function hmacSha256Hex(secret, text) {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(text));
+  return toHex(new Uint8Array(sig));
 }
 
 function toHex(bytes) {
@@ -577,8 +593,8 @@ async function siteExists(env, slug) {
 
 /**
  * Register an email → slug edit-capability grant in emails.json
- * (`{ "<sha256(email)>": ["<slug>", ...] }`). Appends the slug to the email's
- * list (deduped) so one email can own multiple sites.
+ * (`{ "<hmac-sha256(email)>": ["<slug>", ...] }`). Appends the slug to the
+ * email's list (deduped) so one email can own multiple sites.
  */
 async function addEmailGrant(env, emailHash, slug) {
   const grants = (await readJsonMap(env, 'emails.json')) || {};
@@ -606,6 +622,12 @@ async function createSite(env, slug, email) {
   if (!env.RESEND_API_KEY) {
     return Response.json(
       { ok: false, error: 'magic-link email not configured (RESEND_API_KEY not set)' },
+      { status: 503 },
+    );
+  }
+  if (!env.EMAIL_HASH_SECRET) {
+    return Response.json(
+      { ok: false, error: 'magic-link signing key not configured (EMAIL_HASH_SECRET not set)' },
       { status: 503 },
     );
   }
@@ -641,7 +663,7 @@ async function createSite(env, slug, email) {
   // public), then email the owner the link. Nothing secret is stored in R2.
   const code = generateToken();
   const codeHash = await sha256Hex(code);
-  const emailHash = await sha256Hex(normalizeEmail(email));
+  const emailHash = await hmacSha256Hex(env.EMAIL_HASH_SECRET, normalizeEmail(email));
   const exp = Date.now() + MAGIC_TTL_MS;
 
   const magic = (await readJsonMap(env, 'magic.json')) || {};

@@ -29,8 +29,11 @@ npm run dev        # == wrangler dev
 npm run deploy     # == wrangler deploy
 ```
 
-Formatting is Prettier (`.prettierrc`: tabs, `printWidth: 140`, single quotes,
-semi). No npm script wraps it; run `npx prettier --write src/index.js` when editing.
+Style: match the existing committed source — **2-space indentation, single quotes**.
+Do **not** run `npx prettier --write` on the file: the repo's `.prettierrc` declares
+tabs while the committed code is 2-space indented, so prettier would reformat the
+whole file into a huge unrelated diff. Format new code by hand to match the
+surrounding lines.
 
 Deploy gotchas:
 - The custom domain `api.parroquia.app` is bound in the Cloudflare dashboard, not
