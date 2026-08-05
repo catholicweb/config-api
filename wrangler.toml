@@ -13,6 +13,8 @@ workers_dev = false
 #   npx wrangler r2 bucket create parroquia
 #
 #   auth.json                 — top-level credential map { "<sha256(token)>": "<slug>" }
+#   magic.json                — pending one-time magic codes { "<sha256(code)>": {slug, emailHash, exp} }
+#   emails.json               — email→slug grants { "<sha256(email)>": ["<slug>", ...] } (emails hashed)
 #   <slug>/<token>            — a file (token = flat URL-safe filename; clients encode
 #                               local paths by replacing / with -; see README.md)
 # Exposed in the Worker as env.CONTENT.
@@ -24,7 +26,17 @@ workers_dev = false
 #   npx wrangler secret put CLOUDFLARE_ACCOUNT_ID   # Cloudflare account ID
 #   npx wrangler secret put CLOUDFLARE_ZONE_ID      # Zone ID for parroquia.app
 #
+# Secrets required for magic-link email delivery:
+#
+#   npx wrangler secret put RESEND_API_KEY          # API key for the email provider
+#   npx wrangler secret put FROM_EMAIL              # verified sender address (default no-reply@parroquia.app)
+#
 # For local dev, put them in .dev.vars instead (gitignored).
+
+# Non-secret: where the emailed magic link points (the editor magic-link landing
+# page). Defaults to https://editor.parroquia.app/magic when unset.
+[vars]
+MAGIC_LINK_BASE = "https://editor.parroquia.app/magic"
 
 [[r2_buckets]]
 binding = "CONTENT"
