@@ -58,6 +58,8 @@ Request flow, in order:
    - `GET /whoami` — resolves a bearer token to its slug (`whoami`)
    - `GET /sites/list`, `GET /sites/:slug/list` — listing (`listSlugs`/`listFiles`)
    - `POST /sites/:slug` — admin-gated site creation (`createSite`)
+   - `POST /sites/:slug/magic` — open login-link issuance (`loginMagic`)
+   - `POST /sites/:slug/editors` — editor-gated co-editor grant (`addEditor`)
    - `PUT`/`DELETE /sites/:slug/:token` — editor-gated writes (`putFile`/`deleteFile`)
 
 Key helper groups (each has a `// ---` banner comment):
@@ -65,7 +67,13 @@ Key helper groups (each has a `// ---` banner comment):
   `validateSlugNotReserved`. The core of the path-traversal defense.
 - **Crypto** — `sha256Hex`, `generateToken`, `timingSafeEqual`, `bearerToken`.
 - **Auth** — `authorizeAdmin` (admin secret gate for site creation),
-  `authorize` (editor token → slug check), `readAuthMap` (reads top-level `auth.json`).
+  `authorize` (editor token → slug + email-grant check), `readAuthMap`
+  (reads top-level `auth.json`). Editor tokens are bound to their email
+  (`auth.json[tokenHash] = { slug, emailHash }`); the **private** `emails.json`
+  grant (`HMAC(email) → [slugs]`, enforced by `authorize`) is the editor
+  allowlist — it never lives in the public `config.json`. `issueMagicLink`
+  only mints a login link; granting is explicit (`createSite` seed,
+  `POST /sites/:slug/editors`).
 - **Cloudflare provisioning** — `cfFetch`, `ensurePagesProject`, `ensureDnsRecord`,
   `ensureCustomDomain`. One idempotent "ensure" step per Cloudflare resource.
 - **Handlers** — one per endpoint.
@@ -82,7 +90,8 @@ Key helper groups (each has a `// ---` banner comment):
    and `ALLOWED_EXT` **must stay byte-identical** to `editor/.../codec.js` and
    `web-template/.../migrate.js` (see parent CLAUDE.md).
 3. **Slug** — `SLUG_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/`; reserved: `api, editor, www, data`.
-   A token is valid for a slug only if its hash maps to that **exact** slug.
+   A token is valid for a slug only if its hash maps to that **exact** slug, **and** (for
+   email-bound tokens) its bound email is in the slug's `emails.json` grant.
 4. **Timing-safe comparison** — `timingSafeEqual` for both admin hash and editor
    token hash. `authorize`/`whoami` intentionally iterate *all* map entries with no
    early break to avoid leaking which hash matched.
@@ -103,6 +112,8 @@ Key helper groups (each has a `// ---` banner comment):
 - **Site creation provisions Cloudflare resources** via the API (Pages project,
   DNS CNAME `{slug}.parroquia.app` → `{slug}.pages.dev`, custom domain attach),
   each step idempotent. It requires `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`,
-  `CLOUDFLARE_ZONE_ID` secrets and returns the minted token only once.
+  `CLOUDFLARE_ZONE_ID` secrets. It then seeds the site from the **bucket-root
+  `config.json` template** (copied to `<slug>/config.json`; a `503` if the template
+  is missing) and returns the minted token only once.
 - **`slugs.json`** is re-scanned from the bucket on every creation so it always
   matches `/sites/list`, not just an append.
