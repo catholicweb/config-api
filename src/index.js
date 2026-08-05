@@ -68,6 +68,11 @@
  *                                       for a fresh 256-bit editor token. The code is stored
  *                                       only as its SHA-256 in magic.json, is single-use, and
  *                                       expires in 15 minutes; it is consumed (removed) here.
+ *   POST /auth/request               — email a one-time magic login link to every slug the
+ *                                       `email` address can edit (resolved server-side from
+ *                                       emails.json, so the editor can offer an email-only
+ *                                       login). Body: { "email": "<addr>" }. Never grants
+ *                                       access; returns a generic success either way.
  *
  * WRITE (editor bearer token required):
  *   PUT    /sites/:slug/:filename   — overwrite a file (filename = validated human-readable name)
@@ -146,6 +151,14 @@ export default {
     // for an editor token. No auth beyond possession of the code.
     if (segments.length === 2 && segments[0] === 'auth' && segments[1] === 'magic' && method === 'POST') {
       return exchangeMagic(env, request);
+    }
+
+    // POST /auth/request — email a magic login link to every site the address
+    // already has edit access to. Open to all (like /sites/:slug/magic): it only
+    // issues links and never grants access. The slug is resolved server-side from
+    // emails.json, so the editor can offer an email-only login screen.
+    if (segments.length === 2 && segments[0] === 'auth' && segments[1] === 'request' && method === 'POST') {
+      return requestMagicLink(env, request);
     }
 
     if (segments[0] !== 'sites') {
@@ -829,6 +842,56 @@ async function loginMagic(env, request, slug) {
     return Response.json({ ok: false, error: issued.error }, { status: issued.status });
   }
   return Response.json({ ok: true, slug, sent: true, email }, { status: 200 });
+}
+
+/**
+ * POST /auth/request — email a one-time magic login link to every slug the
+ * `email` address already has edit access to. Open to all: like loginMagic it
+ * only issues links and never grants access (authorize still checks the
+ * emails.json grant after the code is redeemed). This is what lets the editor
+ * offer an email-only login screen — the slug(s) are resolved here from the
+ * private emails.json allowlist instead of being typed by the user.
+ *
+ * To avoid account enumeration, the response is deliberately generic: we return
+ * the same 200 whether or not the address has any grant, and only actually send
+ * email(s) when at least one granted slug exists.
+ */
+async function requestMagicLink(env, request) {
+  if (!env.RESEND_API_KEY) {
+    return Response.json(
+      { ok: false, error: 'magic-link email not configured (RESEND_API_KEY not set)' },
+      { status: 503 },
+    );
+  }
+  if (!env.EMAIL_HASH_SECRET) {
+    return Response.json(
+      { ok: false, error: 'magic-link signing key not configured (EMAIL_HASH_SECRET not set)' },
+      { status: 503 },
+    );
+  }
+
+  const body = await readJsonBody(request);
+  if (!body.ok) return Response.json({ error: body.error }, { status: 400 });
+  const email = body.data.email;
+  if (!validateEmail(email)) {
+    return Response.json({ error: 'a valid email is required' }, { status: 400 });
+  }
+
+  // Look up the address's granted slugs (private allowlist). One magic link per
+  // slug; issueMagicLink sends its own email and is best-effort per slug so a
+  // single failure doesn't block the rest.
+  const emailHash = await hmacSha256Hex(env.EMAIL_HASH_SECRET, normalizeEmail(email));
+  const grants = (await readJsonMap(env, 'emails.json')) || {};
+  const slugs = (grants[emailHash] || []).filter(Boolean);
+
+  for (const slug of slugs) {
+    const issued = await issueMagicLink(env, slug, email);
+    if (!issued.ok) {
+      console.error(`[auth/request] failed to email link for slug=${slug}: ${issued.error}`);
+    }
+  }
+
+  return Response.json({ ok: true, email }, { status: 200 });
 }
 
 /**

@@ -47,6 +47,7 @@ the code ever disagree, **the code wins** and this README must be corrected.
 | POST   | `/sites/:slug/magic`     | —               | `:slug` must exist; body `{ "email": "<addr>" }` — email a one-time magic **login** link; does NOT grant access | `200 { ok, slug, sent, email }` / `400/404/502/503` |
 | POST   | `/sites/:slug/editors`   | `Bearer editor` | `:slug` must exist; body `{ "email": "<addr>" }` — grant `<email>` edit access to the slug and email an invite/login link | `200 { ok, slug, sent, email }` / `400/401/403/404/502/503` |
 | POST   | `/auth/magic`            | —               | body `{ "code": "<64hex>" }` (one-time, from the email) | `200 { ok, slug, token }` / `400/404/410` |
+| POST   | `/auth/request`          | —               | body `{ "email": "<addr>" }` — email a one-time magic **login** link to every slug the address can edit (resolved server-side from `emails.json`); never grants access; returns a generic success either way | `200 { ok, email }` / `400/503` |
 | PUT    | `/sites/:slug/:token`    | `Bearer editor` | body = raw bytes, `Content-Type` optional          | `200 { ok, slug, key }` / `400/401/403` |
 | DELETE | `/sites/:slug/:token`    | `Bearer editor` | —                                                  | `200 { ok, slug, key }` / `400/401/403` |
 
@@ -92,6 +93,15 @@ curl -X POST \
   -H "Content-Type: application/json" \
   --data '{"email":"owner@example.com"}' \
   https://api.parroquia.app/sites/<slug>/magic
+
+# Email-only login (open to all): send a magic login link to every slug the inbox
+# can edit. The slug(s) are resolved server-side from emails.json, so the editor can
+# offer a form that asks only for an email. Returns a generic success either way to
+# avoid revealing which addresses have access.
+curl -X POST \
+  -H "Content-Type: application/json" \
+  --data '{"email":"owner@example.com"}' \
+  https://api.parroquia.app/auth/request
 
 # Exchange a one-time magic code (from the emailed link) for an editor token
 curl -X POST -H "Content-Type: application/json" \
@@ -164,6 +174,13 @@ re-login; legacy string tokens are grandfathered).
 emails a link — it does **not** grant anything. The redeemed token only works if the
 address is already in the slug's `emails.json` grant.
 
+**Email-only login** (`POST /auth/request`) removes the slug from the request: the
+editor asks only for the address, and this endpoint emails a login link to **every**
+slug that address is granted in `emails.json` (one link per slug). It never grants
+anything, and it deliberately returns the same generic `200 { ok, email }` whether or
+not the address has access, so it cannot be used to enumerate which addresses are
+granted editors.
+
 **Security notes:** the R2 bucket is **public**, so nothing secret ever lives in it,
 and **editor emails never enter a site's `config.json`** (which *is* served publicly).
 Magic codes are stored only as one-way SHA-256 hashes and are single-use + expiring.
@@ -235,10 +252,11 @@ The magic-link + editor-permissions changes add `POST /auth/magic`,
 are unchanged. The `emails.json` grant is now **enforced** — a brand-new editor
 token only works once its email has been granted, and legacy plain-string
 `auth.json` entries remain accepted. `codec.js` needs no change; `migrate.js`
-(unchanged `PUT`/`GET`) is unaffected. The editor-side magic-link **landing page**
-(at `MAGIC_LINK_BASE` — reads `?code=`, posts it to `POST /auth/magic`, stores the
-returned token) and a **"manage editors" UI** (calls `POST /sites/:slug/editors`;
-adds to / removes from the private grant list) are follow-ups in the **editor** repo.
+(unchanged `PUT`/`GET`) is unaffected. This `POST /auth/request` endpoint powers the
+editor's email-only login. The magic-link **landing page** (at `MAGIC_LINK_BASE` —
+reads `?code=`, posts it to `POST /auth/magic`, stores the returned token) and a
+**"manage editors" UI** (calls `POST /sites/:slug/editors`; adds to / removes from
+the private grant list) are follow-ups in the **editor** repo.
 
 **Deploy prerequisite:** before creating any site, put a default `config.json` at
 the **bucket root** — `createSite` copies it into every new site and returns `503`
