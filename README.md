@@ -44,6 +44,7 @@ the code ever disagree, **the code wins** and this README must be corrected.
 | GET    | `/sites/list`            | —               | —                                                  | `200 { slugs: [...] }` *(legacy alias of `/sites`)* |
 | GET    | `/sites/:slug/list`      | —               | `:slug` validated (see slug rules)                 | `200 { slug, files: [...] }` / `400` *(legacy alias of `/sites/:slug`)* |
 | POST   | `/sites/:slug`           | `Bearer admin`  | `:slug` validated, not reserved; body `{ "email": "<addr>" }` | `201 { ok, slug, sent, email }` / `400/401/403/409/502/503` |
+| POST   | `/sites/:slug/magic`     | `Bearer admin`  | `:slug` must exist; body `{ "email": "<addr>" }` — invite an editor to an existing slug | `200 { ok, slug, sent, email }` / `400/401/403/404/502/503` |
 | POST   | `/auth/magic`            | —               | body `{ "code": "<64hex>" }` (one-time, from the email) | `200 { ok, slug, token }` / `400/404/410` |
 | PUT    | `/sites/:slug/:token`    | `Bearer editor` | body = raw bytes, `Content-Type` optional          | `200 { ok, slug, key }` / `400/401/403` |
 | DELETE | `/sites/:slug/:token`    | `Bearer editor` | —                                                  | `200 { ok, slug, key }` / `400/401/403` |
@@ -128,6 +129,10 @@ and kicks off magic-link login instead:
 5. The worker mints a fresh 256-bit editor token (sha256 → slug in `auth.json`),
    **deletes the code from `magic.json`** (single-use), and returns `{ ok, slug, token }`.
 
+To grant edit capability to someone for an **already-existing** slug, the admin
+calls `POST /sites/:slug/magic` with an email — this issues a magic link (and
+records the email grant) without creating anything new.
+
 **Security notes:** the R2 bucket is **public**, so nothing secret ever lives in it.
 Magic codes are stored only as one-way SHA-256 hashes and are single-use + expiring.
 Email addresses are likewise **not stored in plaintext** — `emails.json` is keyed by
@@ -186,8 +191,9 @@ Magic codes and emails are keyed by **SHA-256** only (the bucket is public).
 Before changing **any** of: token rules, an endpoint, or the R2 layout, update
 this README **and** every file above.
 
-The magic-link change is **additive**: it adds `POST /auth/magic`, changes the
-`POST /sites/:slug` request body, and adds `magic.json`/`emails.json`, but the
+The magic-link change is **additive**: it adds `POST /auth/magic` and
+`POST /sites/:slug/magic`, changes the `POST /sites/:slug` request body, and
+adds `magic.json`/`emails.json`, but the
 editor-token format and all `PUT`/`GET`/`DELETE` endpoints are unchanged, so
 `api.js`, `codec.js`, and `migrate.js` need **no** changes. The editor-side
 magic-link **landing page** (at `MAGIC_LINK_BASE` — reads `?code=`, posts it to

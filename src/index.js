@@ -58,6 +58,17 @@
  *                                      token (see POST /auth/magic below).
  *                                      Rejects reserved slugs: api, editor, www, data
  *
+ * EDITOR INVITE (gated by an admin secret — see authorizeAdmin):
+ *   POST /sites/:slug/magic          — email an existing editor (by email) a magic link for an
+ *                                       EXISTING slug, granting them edit capability. Body:
+ *                                       { "email": "<addr>" }. No provisioning or creation.
+ *
+ * MAGIC-LINK LOGIN (no auth — possession of the one-time code from the email is the proof):
+ *   POST /auth/magic                 — exchange a one-time magic code (from the emailed link)
+ *                                       for a fresh 256-bit editor token. The code is stored
+ *                                       only as its SHA-256 in magic.json, is single-use, and
+ *                                       expires in 15 minutes; it is consumed (removed) here.
+ *
  * WRITE (editor bearer token required):
  *   PUT    /sites/:slug/:filename   — overwrite a file (filename = validated human-readable name)
  *   DELETE /sites/:slug/:filename   — delete a file
@@ -182,6 +193,13 @@ export default {
       }
 
       return createSite(env, slug, email);
+    }
+
+    // POST /sites/:slug/magic — invite an additional editor to an existing slug
+    if (method === 'POST' && segments.length === 3 && segments[2] === 'magic') {
+      const admin = await authorizeAdmin(env, request);
+      if (!admin.ok) return Response.json({ error: admin.error }, { status: admin.status });
+      return inviteEditorMagic(env, request, segments[1]);
     }
 
     // PUT /sites/:slug/:token — write a file (editor-authed)
@@ -659,8 +677,43 @@ async function createSite(env, slug, email) {
     );
   }
 
-  // Register a one-time magic code (stored only as its SHA-256 — the bucket is
-  // public), then email the owner the link. Nothing secret is stored in R2.
+  // Mint a one-time magic code and email the owner the link. Nothing secret is
+  // stored in the (public) bucket.
+  const issued = await issueMagicLink(env, slug, email);
+  if (!issued.ok) {
+    return Response.json({ ok: false, error: issued.error }, { status: issued.status });
+  }
+
+  await env.CONTENT.put(`${slug}/${SITE_MARKER}`, '{"ok":true}', {
+    httpMetadata: { contentType: 'application/json' },
+  });
+
+  // Write the authoritative slugs.json at the bucket root (same shape as the
+  // GET /sites/list response). We re-scan the bucket so the file is always
+  // consistent with reality, not just an append of the current creation.
+  const slugs = await getSlugs(env);
+  await writeJsonMap(env, 'slugs.json', { slugs });
+
+  return Response.json({ ok: true, slug, sent: true, email }, { status: 201 });
+}
+
+/**
+ * Mint a one-time magic code for `slug`, email it to `email`, and record the
+ * email→slug grant. Shared by site creation and by inviting an editor to an
+ * existing slug. Returns { ok:true } or { ok:false, status, error }.
+ *
+ * The code is stored only as its SHA-256 (the bucket is public); it is
+ * single-use and expires after MAGIC_TTL_MS. If email delivery fails, the
+ * pending magic record is rolled back so the caller can stay retryable.
+ */
+async function issueMagicLink(env, slug, email) {
+  if (!env.RESEND_API_KEY) {
+    return { ok: false, status: 503, error: 'magic-link email not configured (RESEND_API_KEY not set)' };
+  }
+  if (!env.EMAIL_HASH_SECRET) {
+    return { ok: false, status: 503, error: 'magic-link signing key not configured (EMAIL_HASH_SECRET not set)' };
+  }
+
   const code = generateToken();
   const codeHash = await sha256Hex(code);
   const emailHash = await hmacSha256Hex(env.EMAIL_HASH_SECRET, normalizeEmail(email));
@@ -672,27 +725,39 @@ async function createSite(env, slug, email) {
 
   const sent = await sendMagicLinkEmail(env, email, slug, code);
   if (!sent.ok) {
-    // Roll back the pending magic record so the slug stays retryable.
+    // Roll back the pending magic record so the caller stays retryable.
     delete magic[codeHash];
     await writeJsonMap(env, 'magic.json', magic);
-    return Response.json(
-      { ok: false, error: `failed to send magic-link email: ${sent.error}` },
-      { status: 502 },
-    );
+    return { ok: false, status: 502, error: `failed to send magic-link email: ${sent.error}` };
   }
 
-  await env.CONTENT.put(`${slug}/${SITE_MARKER}`, '{"ok":true}', {
-    httpMetadata: { contentType: 'application/json' },
-  });
   await addEmailGrant(env, emailHash, slug);
+  return { ok: true };
+}
 
-  // Write the authoritative slugs.json at the bucket root (same shape as the
-  // GET /sites/list response). We re-scan the bucket so the file is always
-  // consistent with reality, not just an append of the current creation.
-  const slugs = await getSlugs(env);
-  await writeJsonMap(env, 'slugs.json', { slugs });
+/**
+ * POST /sites/:slug/magic — invite an editor (by email) to an EXISTING slug,
+ * emailing them a one-time magic link. Admin-gated: the admin chooses who can
+ * edit. No Cloudflare provisioning or slug creation happens here.
+ */
+async function inviteEditorMagic(env, request, slug) {
+  if (!validateSlug(slug)) return Response.json({ error: 'invalid slug' }, { status: 400 });
+  if (!(await siteExists(env, slug))) {
+    return Response.json({ error: 'slug not found' }, { status: 404 });
+  }
 
-  return Response.json({ ok: true, slug, sent: true, email }, { status: 201 });
+  const body = await readJsonBody(request);
+  if (!body.ok) return Response.json({ error: body.error }, { status: 400 });
+  const email = body.data.email;
+  if (!validateEmail(email)) {
+    return Response.json({ error: 'a valid email is required' }, { status: 400 });
+  }
+
+  const issued = await issueMagicLink(env, slug, email);
+  if (!issued.ok) {
+    return Response.json({ ok: false, error: issued.error }, { status: issued.status });
+  }
+  return Response.json({ ok: true, slug, sent: true, email }, { status: 200 });
 }
 
 /**
