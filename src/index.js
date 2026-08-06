@@ -25,7 +25,8 @@
  *
  * Single R2 bucket (`parroquia`, bound as env.CONTENT). Everything lives in it:
  *
- *   auth.json                — top-level credential map: { "<sha256(token)>": "<slug>" }
+ *   auth.enc                 — ALL credential state in one AES-GCM-256 encrypted blob
+ *                              ({ emails, tokens, magic }; encrypted under AUTH_KEY)
  *   <slug>/.site             — per-slug existence marker (created on site creation)
  *   <slug>/<filename>        — a file, where <filename> is a validated human-readable name
  *
@@ -65,37 +66,50 @@
  *
  * MAGIC-LINK LOGIN (no auth — possession of the one-time code from the email is the proof):
  *   POST /auth/magic                 — exchange a one-time magic code (from the emailed link)
- *                                       for a fresh 256-bit editor token. The code is stored
- *                                       only as its SHA-256 in magic.json, is single-use, and
- *                                       expires in 15 minutes; it is consumed (removed) here.
+ *                                       for a fresh 256-bit editor token. The code lives in the
+ *                                       encrypted state (keyed by its SHA-256), is single-use,
+ *                                       and expires in 15 minutes; it is consumed (removed) here.
  *   POST /auth/request               — email a one-time magic login link to every slug the
- *                                       `email` address can edit (resolved server-side from
- *                                       emails.json, so the editor can offer an email-only
- *                                       login). Body: { "email": "<addr>" }. Never grants
- *                                       access; returns a generic success either way.
+ *                                       `email` address can edit (resolved server-side from the
+ *                                       encrypted email allowlist, so the editor can offer an
+ *                                       email-only login). Body: { "email": "<addr>" }. Never
+ *                                       grants access; returns a generic success either way.
  *
  * WRITE (editor bearer token required):
  *   PUT    /sites/:slug/:filename   — overwrite a file (filename = validated human-readable name)
  *   DELETE /sites/:slug/:filename   — delete a file
  *
+ * EDITOR MANAGEMENT (editor bearer token for THIS slug only):
+ *   GET    /sites/:slug/editors     — list the emails granted write access to the slug
+ *   POST   /sites/:slug/editors     — grant an email co-editor access + email an invite link
+ *   PATCH  /sites/:slug/editors     — change an editor's email address (body { from, to })
+ *   DELETE /sites/:slug/editors     — remove an editor + revoke their slug tokens (body { email })
+ *
  * Two distinct capabilities:
  *   - ADMIN_TOKEN_HASH (Worker secret, never in the bucket): gates site creation.
  *     Set with `wrangler secret put ADMIN_TOKEN_HASH` (prod) or `.dev.vars` (local).
- *   - per-slug editor tokens (256-bit random, stored as SHA-256 in auth.json):
- *     gate writes AND reads for that slug only. Tokens are minted via the magic-link
+ *   - per-slug editor tokens (256-bit random, stored as SHA-256 in the encrypted
+ *     state): gate writes for that slug only. Tokens are minted via the magic-link
  *     exchange (POST /auth/magic), not returned directly at site creation.
  *
- * MAGIC-LINK + EMAIL CAPABILITY STORE (all keyed-hashed — the bucket is PUBLIC,
- * so no secrets or plaintext emails ever live in it):
- *   magic.json   { "<sha256(code)>": { "slug", "emailHash", "exp" } }   pending one-time codes
- *   emails.json  { "<hmac-sha256(email)>": ["<slug>", ...] }            email→slug grants (keyed by EMAIL_HASH_SECRET)
+ * SINGLE ENCRYPTED CREDENTIAL STORE (the bucket is PUBLIC, but all credential data
+ * is encrypted at rest in one blob, so it is never readable without AUTH_KEY):
+ *   auth.enc   { v, iv, ct } → plaintext { "emails": { "<email>": ["<slug>",...] },
+ *                                          "tokens": { "<sha256(token)>": { slug, email } },
+ *                                          "magic":  { "<sha256(code)>":   { slug, email, exp } } }
  *
- * Editor auth: the incoming bearer token is SHA-256 hashed and looked up in the
- * top-level `auth.json` object (`{ "<hash>": "<slug>" }`). The request is
- * authorized only if the hash exists AND its mapped slug equals the slug in the
- * URL path. Tokens are 256-bit random values, so their SHA-256 hashes are not
- * brute-forceable. The credential map lives at the bucket root; every content
- * key is `<slug>/<filename>` with a validated filename, so no content key can reach it.
+ * Emails are stored recoverable (plaintext inside the blob) so the worker can
+ * list/remove/rename editors — they are NOT HMAC digests anymore. Tokens and
+ * magic codes stay keyed by SHA-256 for defense in depth. New editor tokens bind
+ * to a plaintext email; any token whose `email` is null is "grandfathered" (a
+ * migrated legacy token) and is authorized for its slug without an allowlist
+ * check, but cannot be listed/removed/renamed by the editor endpoints.
+ *
+ * Editor auth: the incoming bearer token is SHA-256 hashed and looked up directly
+ * in the decrypted `state.tokens`. The request is authorized only if the entry
+ * exists AND its mapped slug equals the slug in the URL path AND (for email-bound
+ * tokens) the email is in the slug's grant list. Tokens are 256-bit random values,
+ * so their SHA-256 hashes are not brute-forceable.
  *
  * CRITICAL INVARIANT: the server must never interpret a filename as a path. It is
  * used verbatim as the R2 key. All path semantics live in the client. If a
@@ -156,7 +170,7 @@ export default {
     // POST /auth/request — email a magic login link to every site the address
     // already has edit access to. Open to all (like /sites/:slug/magic): it only
     // issues links and never grants access. The slug is resolved server-side from
-    // emails.json, so the editor can offer an email-only login screen.
+    // the email grant, so the editor can offer an email-only login screen.
     if (segments.length === 2 && segments[0] === 'auth' && segments[1] === 'request' && method === 'POST') {
       return requestMagicLink(env, request);
     }
@@ -210,8 +224,8 @@ export default {
 
     // POST /sites/:slug/magic — issue a magic login link to an existing slug.
     // Open to all (no admin/editor required): issuing a link does not grant
-    // access, which is still gated by the emails.json grant checked at authorize
-    // after the code is redeemed.
+    // access, which is still gated by the email grant checked at authorize after
+    // the code is redeemed.
     if (method === 'POST' && segments.length === 3 && segments[2] === 'magic') {
       return loginMagic(env, request, segments[1]);
     }
@@ -229,6 +243,37 @@ export default {
       if (!auth.ok) return Response.json({ error: auth.error }, { status: auth.status });
 
       return addEditor(env, request, slug);
+    }
+
+    // Editor management (all editor-gated to THIS slug only). These must match
+    // BEFORE the generic /sites/:slug/:token handlers below (otherwise 'editors'
+    // — a legal filename token — would be treated as a file to write/delete).
+    if (method === 'GET' && segments.length === 3 && segments[2] === 'editors') {
+      const slug = segments[1];
+      if (!validateSlug(slug)) return new Response('Invalid slug', { status: 400 });
+
+      const auth = await authorize(env, slug, request);
+      if (!auth.ok) return Response.json({ error: auth.error }, { status: auth.status });
+
+      return listEditors(env, slug);
+    }
+    if (method === 'DELETE' && segments.length === 3 && segments[2] === 'editors') {
+      const slug = segments[1];
+      if (!validateSlug(slug)) return new Response('Invalid slug', { status: 400 });
+
+      const auth = await authorize(env, slug, request);
+      if (!auth.ok) return Response.json({ error: auth.error }, { status: auth.status });
+
+      return removeEditor(env, request, slug);
+    }
+    if (method === 'PATCH' && segments.length === 3 && segments[2] === 'editors') {
+      const slug = segments[1];
+      if (!validateSlug(slug)) return new Response('Invalid slug', { status: 400 });
+
+      const auth = await authorize(env, slug, request);
+      if (!auth.ok) return Response.json({ error: auth.error }, { status: auth.status });
+
+      return updateEditor(env, request, slug);
     }
 
     // PUT /sites/:slug/:token — write a file (editor-authed)
@@ -319,7 +364,7 @@ function validateEmail(email) {
   return typeof email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
 
-// Canonical form used as the emails.json key hash (trim + lowercase) so the same
+// Canonical form used as the state.emails key (trim + lowercase) so the same
 // address always maps to one entry regardless of case/whitespace.
 function normalizeEmail(email) {
   return email.trim().toLowerCase();
@@ -338,20 +383,20 @@ async function sha256Hex(text) {
   return hex;
 }
 
-// Keyed HMAC-SHA256 of a value. Used to hash email addresses for emails.json:
-// the bucket is public, and a *plain* sha256 of an email is trivially
-// brute-forceable (small input space). Keying with EMAIL_HASH_SECRET makes the
-// stored digests un-reversible without the secret.
-async function hmacSha256Hex(secret, text) {
-  const key = await crypto.subtle.importKey(
-    'raw',
-    new TextEncoder().encode(secret),
-    { name: 'HMAC', hash: 'SHA-256' },
-    false,
-    ['sign'],
-  );
-  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(text));
-  return toHex(new Uint8Array(sig));
+// Base64 codecs for binary <-> string. Workers exposes global btoa/atob, which
+// operate on binary strings, so wrap Uint8Array. Enough for the 12-byte IV and
+// the small ciphertexts produced by AES-GCM here; no chunking needed.
+function bytesToBase64(bytes) {
+  let s = '';
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s);
+}
+
+function base64ToBytes(b64) {
+  const s = atob(b64);
+  const bytes = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) bytes[i] = s.charCodeAt(i);
+  return bytes;
 }
 
 function toHex(bytes) {
@@ -382,6 +427,159 @@ function bearerToken(request) {
   if (!h) return null;
   const m = /^\s*Bearer\s+(.+?)\s*$/i.exec(h);
   return m ? m[1] : null;
+}
+
+// ---------------------------------------------------------------------------
+// Encrypted auth state — one AES-GCM-256 blob (auth.enc) at the bucket root
+// ---------------------------------------------------------------------------
+//
+// All credential state (emails allowlist, editor tokens, pending magic codes)
+// lives in a SINGLE encrypted object instead of three public plaintext JSON
+// files. Emails are recoverable (they sit in plaintext inside the encrypted
+// blob) so the worker can list/remove/rename editors — impossible when they were
+// stored as irreversible HMAC digests. Tokens remain keyed by their SHA-256 for
+// defense in depth even though the blob is encrypted.
+//
+//   auth.enc = { "v": 1, "iv": "<base64 12-byte>", "ct": "<base64 ct+tag>" }
+//
+// Decrypting to a null signals AUTH_KEY is wrong/corrupt; handlers return 503
+// and must never trigger a re-migration over an existing auth.enc (that would
+// clobber the only copy of the recovered state).
+
+async function authKey(env) {
+  if (!env.AUTH_KEY) return null;
+  const raw = base64ToBytes(env.AUTH_KEY);
+  if (raw.length !== 32) return null; // AES-256 requires exactly 32 raw bytes
+  return crypto.subtle.importKey(
+    'raw',
+    raw,
+    { name: 'AES-GCM' },
+    false,
+    ['encrypt', 'decrypt'],
+  );
+}
+
+// Encrypt a state object to the auth.enc blob. A fresh random 12-byte IV is used
+// on every call — reusing an IV across encrypts under the same AES-GCM key leaks
+// the key stream, so never cache/reuse an IV.
+async function encryptState(env, state) {
+  const key = await authKey(env);
+  if (!key) throw new Error('AUTH_KEY not configured');
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const pt = new TextEncoder().encode(JSON.stringify(state));
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, pt);
+  // ct already carries the 16-byte GCM auth tag appended
+  return { v: AUTH_STATE_V, iv: bytesToBase64(iv), ct: bytesToBase64(new Uint8Array(ct)) };
+}
+
+// Decrypt an auth.enc blob. Returns the state object, or null on any failure
+// (wrong key, tamper, wrong version, bad shape).
+async function decryptState(env, blob) {
+  try {
+    const key = await authKey(env);
+    if (!key || !blob || blob.v !== AUTH_STATE_V) return null;
+    const iv = base64ToBytes(blob.iv);
+    const ct = base64ToBytes(blob.ct);
+    const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct);
+    const s = JSON.parse(new TextDecoder().decode(pt));
+    if (!s || typeof s !== 'object' || Array.isArray(s)) return null;
+    s.emails = s.emails || {};
+    s.tokens = s.tokens || {};
+    s.magic = s.magic || {};
+    return s;
+  } catch {
+    return null;
+  }
+}
+
+// Read the whole auth store, driving the one-time legacy migration first.
+// Returns the state, or null if it cannot be decrypted (AUTH_KEY wrong/corrupt).
+async function readAuthState(env) {
+  await maybeMigrate(env);
+  const obj = await env.CONTENT.get(AUTH_FILE);
+  if (!obj) return { emails: {}, tokens: {}, magic: {} }; // virgin state
+  let blob;
+  try {
+    blob = JSON.parse(await obj.text());
+  } catch {
+    return null;
+  }
+  return decryptState(env, blob);
+}
+
+// Write the whole auth store back as a single encrypted blob.
+async function writeAuthState(env, state) {
+  await env.CONTENT.put(AUTH_FILE, JSON.stringify(await encryptState(env, state)), {
+    httpMetadata: { contentType: 'application/json' },
+  });
+}
+
+// Shared read -> mutate in place -> write loop. Returns the mutated state, or
+// null if the store couldn't be read (caller decides 503).
+async function mutateState(env, fn) {
+  const state = await readAuthState(env);
+  if (!state) return null;
+  fn(state);
+  await writeAuthState(env, state);
+  return state;
+}
+
+// Lazy one-time migration from the legacy plaintext stores (auth.json,
+// magic.json, emails.json) to the single encrypted auth.enc. Runs the first time
+// any auth state is read and auth.enc is absent; afterwards it is a no-op.
+//
+// Because the legacy email digests are HMAC(EMAIL_HASH_SECRET, email) —
+// irreversible — the old email->slug allowlist cannot be reconstructed. So:
+//   - auth.json entries migrate as GRANDFATHERED tokens (email: null): they keep
+//     write access for their slug but are not bound to an email, so the new
+//     editor endpoints can't list/remove/rename them.
+//   - magic.json codes migrate with email: null (their redemption mints a
+//     grandfathered token).
+//   - emails.json is dropped (unrecoverable); the allowlist repopulates only as
+//     new editor grants are added.
+//
+// Gated on `head(AUTH_FILE)` (not an env flag) so two racing first requests
+// don't both rebuild, and a fresh isolate after a cold start still skips. The
+// body is idempotent: concurrent writers produce the same state, last-write-wins.
+// The encrypted blob is written FIRST, then the now-redundant plaintext files are
+// deleted. Never call deletion when auth.enc is present.
+async function maybeMigrate(env) {
+  if (await env.CONTENT.head(AUTH_FILE)) return; // already modern — never touch legacy
+  if (!env.AUTH_KEY) return; // can't build auth.enc yet; authed calls will 503
+
+  const state = { emails: {}, tokens: {}, magic: {} };
+
+  const auth = await readJsonMap(env, 'auth.json');
+  if (auth) {
+    for (const [hash, val] of Object.entries(auth)) {
+      if (typeof hash !== 'string' || !hash) continue;
+      const slug = typeof val === 'string' ? val : (val && val.slug);
+      if (slug) state.tokens[hash] = { slug, email: null };
+    }
+  }
+
+  const magic = await readJsonMap(env, 'magic.json');
+  if (magic) {
+    for (const [hash, rec] of Object.entries(magic)) {
+      if (typeof hash !== 'string' || !hash) continue;
+      if (rec && rec.slug && typeof rec.exp === 'number' && rec.exp >= Date.now()) {
+        state.magic[hash] = { slug: rec.slug, email: null, exp: rec.exp };
+      }
+    }
+  }
+
+  // emails.json cannot be reconstructed; state.emails stays empty.
+
+  await writeAuthState(env, state);
+
+  // Only after the encrypted write succeeds do we remove the redundant public
+  // plaintext credentials. A failed delete leaves a harmless orphan file (nothing
+  // reads it anymore); skipping deletion entirely would defeat the security goal.
+  await Promise.allSettled([
+    env.CONTENT.delete('auth.json'),
+    env.CONTENT.delete('magic.json'),
+    env.CONTENT.delete('emails.json'),
+  ]);
 }
 
 // Parse a JSON request body. Returns { ok:true, data } or { ok:false, error }.
@@ -424,8 +622,9 @@ async function authorizeAdmin(env, request) {
 }
 
 /**
- * Read and parse a top-level JSON object store (auth.json, magic.json,
- * emails.json). Returns null if absent, unreadable, or not a plain object.
+ * Read and parse a top-level JSON object store (used for the legacy files during
+ * migration, and for slugs.json). Returns null if absent, unreadable, or not a
+ * plain object.
  */
 async function readJsonMap(env, key) {
   const obj = await env.CONTENT.get(key);
@@ -453,62 +652,33 @@ async function writeJsonMap(env, key, map) {
 }
 
 /**
- * Read and parse the top-level auth.json (`{ "<sha256(token)>": "<slug>" }`).
- * Returns null if absent or unreadable.
- */
-async function readAuthMap(env) {
-  return readJsonMap(env, 'auth.json');
-}
-
-/**
- * Authorize an editor request for `slug`. The bearer token is SHA-256 hashed
- * and must be present in auth.json, mapped to this slug, AND (for email-bound
- * tokens) have its email listed in the slug's emails.json grant. Iterates all
- * entries (no early break) to avoid leaking which hash matched.
+ * Authorize an editor request for `slug`. The bearer token is SHA-256 hashed and
+ * looked up directly in the single encrypted state (`state.tokens[sha256(token)]`).
+ * The token is valid only if its mapped slug equals the URL slug. For email-bound
+ * tokens, the bound email must also be listed in the slug's grant. Grandfathered
+ * tokens (`email: null` — migrated from the pre-email legacy format) pass on slug
+ * match alone, keeping their write access.
  *
- * Legacy auth.json entries (plain `tokenHash → "slug"` strings, minted before
- * tokens were bound to an email) are grandfathered: they pass the plain slug
- * check with no email requirement. They only lose that status once the holder
- * re-logs in via magic and gets an email-bound token.
+ * Direct object lookup replaces the old all-entries `timingSafeEqual` sweep: token
+ * hashes are 256-bit random values, so a timing side channel on a single key probe
+ * leaks nothing brute-forceable.
  */
 async function authorize(env, slug, request) {
   const token = bearerToken(request);
   if (!token) return { ok: false, status: 401, error: 'missing bearer token' };
 
   const tokenHash = await sha256Hex(token);
-  const map = await readAuthMap(env);
-  if (!map) return { ok: false, status: 401, error: 'no auth configured' };
+  const state = await readAuthState(env);
+  if (!state) return { ok: false, status: 503, error: 'auth state unavailable' };
 
-  let entry = null;
-  for (const [hash, value] of Object.entries(map)) {
-    if (typeof hash === 'string' && timingSafeEqual(hash, tokenHash)) {
-      entry = value;
-    }
-  }
-  if (entry == null) {
-    return { ok: false, status: 403, error: 'token not valid for this slug' };
-  }
-
-  // Legacy string entry (token → slug, no bound email): keep the old behavior.
-  if (typeof entry === 'string') {
-    return entry === slug
-      ? { ok: true }
-      : { ok: false, status: 403, error: 'token not valid for this slug' };
-  }
-
-  // Email-bound entry: { slug, emailHash }.
+  const entry = state.tokens[tokenHash];
   if (!entry || entry.slug !== slug) {
     return { ok: false, status: 403, error: 'token not valid for this slug' };
   }
-  if (!entry.emailHash) {
-    return { ok: false, status: 403, error: 'token has no bound email' };
-  }
+  if (entry.email == null) return { ok: true }; // grandfathered: no grant check
 
-  const grants = await readJsonMap(env, 'emails.json');
-  const list = grants && Array.isArray(grants[entry.emailHash])
-    ? grants[entry.emailHash]
-    : [];
-  if (!list.includes(slug)) {
+  const slugs = state.emails[entry.email] || [];
+  if (!slugs.includes(slug)) {
     return { ok: false, status: 403, error: 'email not authorized for this slug' };
   }
   return { ok: true };
@@ -520,18 +690,12 @@ async function whoami(env, request) {
   if (!token) return Response.json({ error: 'missing bearer token' }, { status: 401 });
 
   const tokenHash = await sha256Hex(token);
-  const map = await readAuthMap(env);
-  if (!map) return Response.json({ error: 'no auth configured' }, { status: 401 });
+  const state = await readAuthState(env);
+  if (!state) return Response.json({ error: 'auth state unavailable' }, { status: 503 });
 
-  let slug = null;
-  for (const [hash, value] of Object.entries(map)) {
-    if (typeof hash === 'string' && timingSafeEqual(hash, tokenHash)) {
-      // New entries are { slug, emailHash }; legacy entries are plain strings.
-      slug = typeof value === 'string' ? value : (value && value.slug) || null;
-    }
-  }
-  if (!slug) return Response.json({ error: 'invalid token' }, { status: 403 });
-  return Response.json({ slug });
+  const entry = state.tokens[tokenHash];
+  if (!entry) return Response.json({ error: 'invalid token' }, { status: 403 });
+  return Response.json({ slug: entry.slug });
 }
 
 // ---------------------------------------------------------------------------
@@ -638,6 +802,11 @@ const SITE_MARKER = '.site';
 // longer be exchanged for an editor token.
 const MAGIC_TTL_MS = 15 * 60 * 1000;
 
+// Single encrypted credential store at the bucket root (replaces auth.json,
+// magic.json, emails.json). Its plaintext payload is { emails, tokens, magic }.
+const AUTH_FILE = 'auth.enc';
+const AUTH_STATE_V = 1; // encrypted-blob format version
+
 /**
  * List all slugs by scanning the R2 bucket for top-level "folders".
  * Returns a bare `string[]` of slug names. This is the authoritative source;
@@ -664,22 +833,26 @@ async function siteExists(env, slug) {
   if (await env.CONTENT.head(`${slug}/${SITE_MARKER}`)) return true;
   const listed = await env.CONTENT.list({ prefix: `${slug}/`, limit: 1 });
   if (listed.objects.length > 0) return true;
-  const map = await readAuthMap(env);
-  if (map && Object.values(map).includes(slug)) return true;
+  // Legacy pre-marker slugs (a token/grant existed without a .site marker).
+  const state = await readAuthState(env);
+  if (!state) return false;
+  for (const e of Object.values(state.tokens)) if (e && e.slug === slug) return true;
+  for (const slugs of Object.values(state.emails)) {
+    if (Array.isArray(slugs) && slugs.includes(slug)) return true;
+  }
   return false;
 }
 
 /**
- * Register an email → slug edit-capability grant in emails.json
- * (`{ "<hmac-sha256(email)>": ["<slug>", ...] }`). Appends the slug to the
- * email's list (deduped) so one email can own multiple sites.
+ * Register an email → slug edit-capability grant in the in-memory state
+ * (`state.emails[email] = ["<slug>", ...]`). Appends the slug to the email's list
+ * (deduped) so one email can own multiple sites. This is a pure mutation on the
+ * caller-owned state object; the caller writes it back via writeAuthState.
  */
-async function addEmailGrant(env, emailHash, slug) {
-  const grants = (await readJsonMap(env, 'emails.json')) || {};
-  const list = grants[emailHash] || [];
+function addEmailGrant(state, email, slug) {
+  const list = state.emails[email] || [];
   if (!list.includes(slug)) list.push(slug);
-  grants[emailHash] = list;
-  await writeJsonMap(env, 'emails.json', grants);
+  state.emails[email] = list;
 }
 
 /**
@@ -688,14 +861,14 @@ async function addEmailGrant(env, emailHash, slug) {
  * Provisions Cloudflare resources (Pages project, DNS CNAME, custom domain) —
  * idempotent, unchanged from before — then seeds the site: copies the root
  * config.json template into <slug>/config.json, grants the owner edit access in
- * emails.json, and emails them a magic login link instead of returning a token.
- * The email only arrives after provisioning succeeds; if delivery fails, the
- * just-created magic record is rolled back so a retry of this POST is clean
- * (the slug has no marker yet and is not yet listed).
+ * the encrypted auth.enc email allowlist, and emails them a magic login link
+ * instead of returning a token. The email only arrives after provisioning
+ * succeeds.
  *
- * NOTE: magic.json / emails.json are read-modify-written, so concurrent
- * creations can race (last write wins). This API is meant for occasional admin
- * bootstrapping, not concurrent mass-creation.
+ * NOTE: every credential mutation now reads, mutates, and writes back the single
+ * encrypted auth.enc, so concurrent creations/mutations can race (last write
+ * wins). This API is meant for occasional admin bootstrapping, not concurrent
+ * mass-creation.
  */
 async function createSite(env, slug, email) {
   if (!env.RESEND_API_KEY) {
@@ -704,9 +877,9 @@ async function createSite(env, slug, email) {
       { status: 503 },
     );
   }
-  if (!env.EMAIL_HASH_SECRET) {
+  if (!env.AUTH_KEY) {
     return Response.json(
-      { ok: false, error: 'magic-link signing key not configured (EMAIL_HASH_SECRET not set)' },
+      { ok: false, error: 'auth encryption key not configured (AUTH_KEY not set)' },
       { status: 503 },
     );
   }
@@ -754,11 +927,10 @@ async function createSite(env, slug, email) {
     httpMetadata: { contentType: 'application/json' },
   });
 
-  // Grant the owner editor access (emails.json is the private, enforced
-  // allowlist) and email them their first login link. Nothing secret is stored
-  // in the (public) bucket.
-  const emailHash = await hmacSha256Hex(env.EMAIL_HASH_SECRET, normalizeEmail(email));
-  await addEmailGrant(env, emailHash, slug);
+  // Grant the owner editor access (the encrypted email allowlist is the enforced
+  // allowlist) and email them their first login link.
+  const state = await mutateState(env, (s) => addEmailGrant(s, normalizeEmail(email), slug));
+  if (!state) return Response.json({ error: 'auth state unavailable' }, { status: 503 });
 
   const issued = await issueMagicLink(env, slug, email);
   if (!issued.ok) {
@@ -781,48 +953,43 @@ async function createSite(env, slug, email) {
 /**
  * Mint a one-time magic code for `slug` and email the login link to `email`.
  * This ONLY issues a login link — it does NOT grant the address access. Whether
- * the redeemed token can write is decided later by `authorize` against the
- * emails.json grant, which is seeded by `createSite` and added via
- * `POST /sites/:slug/editors`. Returns { ok:true } or { ok:false, status, error }.
+ * the redeemed token can write is decided later by `authorize` against the email
+ * grant, which is seeded by `createSite` and added via `POST /sites/:slug/editors`.
+ * Returns { ok:true } or { ok:false, status, error }.
  *
- * The code is stored only as its SHA-256 (the bucket is public); it is
- * single-use and expires after MAGIC_TTL_MS. If email delivery fails, the
- * pending magic record is rolled back so the caller can stay retryable.
+ * The code is stored in the encrypted state (keyed by its SHA-256), is single-use,
+ * and expires after MAGIC_TTL_MS. The email is sent first; only on success is the
+ * code recorded, so a delivery failure leaves no stale pending code to roll back.
  */
 async function issueMagicLink(env, slug, email) {
   if (!env.RESEND_API_KEY) {
     return { ok: false, status: 503, error: 'magic-link email not configured (RESEND_API_KEY not set)' };
   }
-  if (!env.EMAIL_HASH_SECRET) {
-    return { ok: false, status: 503, error: 'magic-link signing key not configured (EMAIL_HASH_SECRET not set)' };
-  }
 
   const code = generateToken();
   const codeHash = await sha256Hex(code);
-  const emailHash = await hmacSha256Hex(env.EMAIL_HASH_SECRET, normalizeEmail(email));
   const exp = Date.now() + MAGIC_TTL_MS;
 
-  const magic = (await readJsonMap(env, 'magic.json')) || {};
-  magic[codeHash] = { slug, emailHash, exp };
-  await writeJsonMap(env, 'magic.json', magic);
-
+  // Send the email first, then record the code. A crash between the two leaves a
+  // dead link rather than a stuck pending code; the caller is otherwise retryable.
   const sent = await sendMagicLinkEmail(env, email, slug, code);
   if (!sent.ok) {
-    // Roll back the pending magic record so the caller stays retryable.
-    delete magic[codeHash];
-    await writeJsonMap(env, 'magic.json', magic);
     return { ok: false, status: 502, error: `failed to send magic-link email: ${sent.error}` };
   }
 
+  const state = await readAuthState(env);
+  if (!state) return { ok: false, status: 503, error: 'auth state unavailable' };
+  state.magic[codeHash] = { slug, email: normalizeEmail(email), exp };
+  await writeAuthState(env, state);
   return { ok: true };
 }
 
 /**
  * POST /sites/:slug/magic — email a one-time magic login link to `email` for an
  * EXISTING slug. Open to all: this only issues a login link and does NOT grant
- * access. The address must already be in the slug's emails.json allowlist for
- * the redeemed token to actually be able to write. No Cloudflare provisioning
- * or slug creation happens here.
+ * access. The address must already be in the slug's email grant for the redeemed
+ * token to actually be able to write. No Cloudflare provisioning or slug creation
+ * happens here.
  */
 async function loginMagic(env, request, slug) {
   if (!validateSlug(slug)) return Response.json({ error: 'invalid slug' }, { status: 400 });
@@ -847,10 +1014,10 @@ async function loginMagic(env, request, slug) {
 /**
  * POST /auth/request — email a one-time magic login link to every slug the
  * `email` address already has edit access to. Open to all: like loginMagic it
- * only issues links and never grants access (authorize still checks the
- * emails.json grant after the code is redeemed). This is what lets the editor
- * offer an email-only login screen — the slug(s) are resolved here from the
- * private emails.json allowlist instead of being typed by the user.
+ * only issues links and never grants access (authorize still checks the email
+ * grant after the code is redeemed). This is what lets the editor offer an
+ * email-only login screen — the slug(s) are resolved here from the (encrypted)
+ * email allowlist instead of being typed by the user.
  *
  * To avoid account enumeration, the response is deliberately generic: we return
  * the same 200 whether or not the address has any grant, and only actually send
@@ -863,12 +1030,6 @@ async function requestMagicLink(env, request) {
       { status: 503 },
     );
   }
-  if (!env.EMAIL_HASH_SECRET) {
-    return Response.json(
-      { ok: false, error: 'magic-link signing key not configured (EMAIL_HASH_SECRET not set)' },
-      { status: 503 },
-    );
-  }
 
   const body = await readJsonBody(request);
   if (!body.ok) return Response.json({ error: body.error }, { status: 400 });
@@ -877,13 +1038,13 @@ async function requestMagicLink(env, request) {
     return Response.json({ error: 'a valid email is required' }, { status: 400 });
   }
 
-  // Look up the address's granted slugs (private allowlist). One magic link per
-  // slug; issueMagicLink sends its own email and is best-effort per slug so a
-  // single failure doesn't block the rest.
-  const emailHash = await hmacSha256Hex(env.EMAIL_HASH_SECRET, normalizeEmail(email));
-  const grants = (await readJsonMap(env, 'emails.json')) || {};
-  const slugs = (grants[emailHash] || []).filter(Boolean);
+  // Look up the address's granted slugs from the decrypted state. One magic link
+  // per slug; issueMagicLink sends its own email and is best-effort per slug so
+  // a single failure doesn't block the rest.
+  const state = await readAuthState(env);
+  if (!state) return Response.json({ error: 'auth state unavailable' }, { status: 503 });
 
+  const slugs = (state.emails[normalizeEmail(email)] || []).filter(Boolean);
   for (const slug of slugs) {
     const issued = await issueMagicLink(env, slug, email);
     if (!issued.ok) {
@@ -898,9 +1059,9 @@ async function requestMagicLink(env, request) {
  * POST /sites/:slug/editors — grant `email` edit access to an EXISTING slug and
  * email them an invite/login link. Editor-gated (the router authorizes first):
  * write permission to the slug is enough to add new co-editors, since a writer
- * can already do unbounded damage to the repo. The grant is recorded privately
- * in emails.json (HMAC-keyed, bucket root — never served publicly) rather than
- * in the public config.json, so editor emails stay out of the public data host.
+ * can already do unbounded damage to the repo. The grant is recorded inside the
+ * encrypted auth.enc (never in the public config.json), so editor emails stay
+ * out of the public data host but remain recoverable by the worker.
  */
 async function addEditor(env, request, slug) {
   if (!(await siteExists(env, slug))) {
@@ -914,14 +1075,109 @@ async function addEditor(env, request, slug) {
     return Response.json({ error: 'a valid email is required' }, { status: 400 });
   }
 
-  const emailHash = await hmacSha256Hex(env.EMAIL_HASH_SECRET, normalizeEmail(email));
-  await addEmailGrant(env, emailHash, slug);
+  const state = await mutateState(env, (s) => addEmailGrant(s, normalizeEmail(email), slug));
+  if (!state) return Response.json({ error: 'auth state unavailable' }, { status: 503 });
 
   const issued = await issueMagicLink(env, slug, email);
   if (!issued.ok) {
     return Response.json({ ok: false, error: issued.error }, { status: issued.status });
   }
   return Response.json({ ok: true, slug, sent: true, email }, { status: 200 });
+}
+
+/**
+ * GET /sites/:slug/editors — list the emails granted edit access to `slug`.
+ * Editor-gated to this slug (the router authorizes first). Emails are recoverable
+ * because they live plaintext inside the encrypted auth.enc.
+ */
+async function listEditors(env, slug) {
+  if (!(await siteExists(env, slug))) {
+    return Response.json({ error: 'slug not found' }, { status: 404 });
+  }
+  const state = await readAuthState(env);
+  if (!state) return Response.json({ error: 'auth state unavailable' }, { status: 503 });
+
+  const editors = Object.entries(state.emails)
+    .filter(([, slugs]) => slugs.includes(slug))
+    .map(([email]) => email);
+  return Response.json({ ok: true, slug, editors });
+}
+
+/**
+ * DELETE /sites/:slug/editors — remove `email`'s edit access to `slug` and revoke
+ * every non-grandfathered token bound to that email for this slug. Body
+ * `{ "email": "<addr>" }`. Grandfathered (email: null) tokens are not bound to an
+ * email and so cannot be revoked here — a migrated editor keeps write access
+ * until they re-login via magic. Returns 404 if the email isn't currently an
+ * editor of this slug.
+ */
+async function removeEditor(env, request, slug) {
+  if (!(await siteExists(env, slug))) {
+    return Response.json({ error: 'slug not found' }, { status: 404 });
+  }
+
+  const body = await readJsonBody(request);
+  if (!body.ok) return Response.json({ error: body.error }, { status: 400 });
+  const email = normalizeEmail(body.data.email);
+  if (!validateEmail(email)) {
+    return Response.json({ error: 'a valid email is required' }, { status: 400 });
+  }
+
+  const state = await readAuthState(env);
+  if (!state) return Response.json({ error: 'auth state unavailable' }, { status: 503 });
+  if (!(state.emails[email] || []).includes(slug)) {
+    return Response.json({ error: 'email is not an editor of this slug' }, { status: 404 });
+  }
+
+  state.emails[email] = state.emails[email].filter((s) => s !== slug);
+  if (state.emails[email].length === 0) delete state.emails[email];
+  // Revoke this email's tokens for the slug (grandfathered email:null tokens are
+  // skipped — they aren't bound to an email).
+  for (const [hash, e] of Object.entries(state.tokens)) {
+    if (e.slug === slug && e.email === email) delete state.tokens[hash];
+  }
+  await writeAuthState(env, state);
+  return Response.json({ ok: true, slug, email }, { status: 200 });
+}
+
+/**
+ * PATCH /sites/:slug/editors — change an editor's email address for `slug`.
+ * Body `{ "from": "<old>", "to": "<new>" }`. Re-grants `to` and re-binds all of
+ * `from`'s email-bound tokens for this slug to `to`, so the editor keeps their
+ * existing logged-in sessions. Returns 404 if `from` isn't currently an editor.
+ */
+async function updateEditor(env, request, slug) {
+  if (!(await siteExists(env, slug))) {
+    return Response.json({ error: 'slug not found' }, { status: 404 });
+  }
+
+  const body = await readJsonBody(request);
+  if (!body.ok) return Response.json({ error: body.error }, { status: 400 });
+  const from = normalizeEmail(body.data.from);
+  const to = normalizeEmail(body.data.to);
+  if (!validateEmail(to)) {
+    return Response.json({ error: 'a valid target email is required' }, { status: 400 });
+  }
+
+  const state = await readAuthState(env);
+  if (!state) return Response.json({ error: 'auth state unavailable' }, { status: 503 });
+  if (!(state.emails[from] || []).includes(slug)) {
+    return Response.json({ error: 'from email is not an editor of this slug' }, { status: 404 });
+  }
+
+  // Rebind the grant (dedupe into the target).
+  state.emails[from] = state.emails[from].filter((s) => s !== slug);
+  if (state.emails[from].length === 0) delete state.emails[from];
+  const toList = state.emails[to] || [];
+  if (!toList.includes(slug)) toList.push(slug);
+  state.emails[to] = toList;
+
+  // Rebind this slug's email-bound tokens from 'from' to 'to'.
+  for (const e of Object.values(state.tokens)) {
+    if (e.slug === slug && e.email === from) e.email = to;
+  }
+  await writeAuthState(env, state);
+  return Response.json({ ok: true, slug, from, to }, { status: 200 });
 }
 
 /**
@@ -973,11 +1229,11 @@ async function sendMagicLinkEmail(env, email, slug, code) {
  * POST /auth/magic — exchange a one-time magic code for a fresh editor token.
  * Proves possession of the emailed link (the code is single-use and expires).
  *
- * Reads magic.json, finds the code by its SHA-256, checks expiry, then mints a
- * 256-bit editor token (sha256 stored in auth.json → { slug, emailHash }, where
- * emailHash is the grant keyed identity of the person who redeemed the link),
- * removes the code from magic.json (one-time invalidation), and returns the
- * token once.
+ * Reads the encrypted state, finds the code by its SHA-256, checks expiry, then
+ * mints a 256-bit editor token (sha256 stored in state.tokens → { slug, email }),
+ * removes the code (one-time invalidation), and returns the token once. The
+ * minted token inherits the code's bound email — which may be null for migrated
+ * (grandfathered) codes, yielding a grandfathered token.
  */
 async function exchangeMagic(env, request) {
   const body = await readJsonBody(request);
@@ -989,31 +1245,29 @@ async function exchangeMagic(env, request) {
   }
 
   const codeHash = await sha256Hex(code);
-  const magic = await readJsonMap(env, 'magic.json');
-  if (!magic) return Response.json({ error: 'no magic link configured' }, { status: 404 });
+  const state = await readAuthState(env);
+  if (!state) return Response.json({ error: 'auth state unavailable' }, { status: 503 });
 
-  const record = magic[codeHash];
+  const record = state.magic[codeHash];
   if (!record) return Response.json({ error: 'invalid or already-used magic code' }, { status: 404 });
 
   if (typeof record.exp === 'number' && record.exp < Date.now()) {
     // Expired: consume it and refuse.
-    delete magic[codeHash];
-    await writeJsonMap(env, 'magic.json', magic);
+    delete state.magic[codeHash];
+    await writeAuthState(env, state);
     return Response.json({ error: 'magic code expired' }, { status: 410 });
   }
 
   const slug = record.slug;
 
   // Consume the code first so it cannot be reused, then mint the editor token.
-  delete magic[codeHash];
-  await writeJsonMap(env, 'magic.json', magic);
+  delete state.magic[codeHash];
 
   const token = generateToken();
   const tokenHash = await sha256Hex(token);
+  state.tokens[tokenHash] = { slug, email: record.email == null ? null : record.email };
 
-  const map = (await readAuthMap(env)) || {};
-  map[tokenHash] = { slug, emailHash: record.emailHash };
-  await writeJsonMap(env, 'auth.json', map);
+  await writeAuthState(env, state);
 
   return Response.json({ ok: true, slug, token }, { status: 200 });
 }

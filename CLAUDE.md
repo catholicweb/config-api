@@ -59,19 +59,26 @@ Request flow, in order:
    - `GET /sites/list`, `GET /sites/:slug/list` — listing (`listSlugs`/`listFiles`)
    - `POST /sites/:slug` — admin-gated site creation (`createSite`)
    - `POST /sites/:slug/magic` — open login-link issuance (`loginMagic`)
-   - `POST /sites/:slug/editors` — editor-gated co-editor grant (`addEditor`)
+   - `GET`/`POST`/`PATCH`/`DELETE /sites/:slug/editors` — editor-gated editor
+     management (`listEditors`/`addEditor`/`updateEditor`/`removeEditor`)
    - `PUT`/`DELETE /sites/:slug/:token` — editor-gated writes (`putFile`/`deleteFile`)
 
 Key helper groups (each has a `// ---` banner comment):
 - **Validation** — `validateFilename`, `validateSlug`, `validateToken`,
   `validateSlugNotReserved`. The core of the path-traversal defense.
-- **Crypto** — `sha256Hex`, `generateToken`, `timingSafeEqual`, `bearerToken`.
+- **Crypto** — `sha256Hex`, `generateToken`, `timingSafeEqual`, `bearerToken`,
+  plus the AES-GCM state helpers (`authKey`, `encryptState`, `decryptState`,
+  `bytesToBase64`/`base64ToBytes`) for `auth.enc`. (HMAC email hashing was removed.)
 - **Auth** — `authorizeAdmin` (admin secret gate for site creation),
-  `authorize` (editor token → slug + email-grant check), `readAuthMap`
-  (reads top-level `auth.json`). Editor tokens are bound to their email
-  (`auth.json[tokenHash] = { slug, emailHash }`); the **private** `emails.json`
-  grant (`HMAC(email) → [slugs]`, enforced by `authorize`) is the editor
-  allowlist — it never lives in the public `config.json`. `issueMagicLink`
+  `authorize` (editor token → slug + email-grant check), and the encrypted-state
+  helpers `readAuthState`/`writeAuthState`/`mutateState`/`maybeMigrate`. All
+  credential data lives in ONE AES-GCM-256 blob `auth.enc` at the bucket root
+  (decrypted under `AUTH_KEY` to `{ emails, tokens, magic }`); it replaces the old
+  `auth.json`/`magic.json`/`emails.json`. Editor tokens are bound to a plaintext
+  email (`tokens[sha256(token)] = { slug, email }`); the **recoverable** `emails`
+  grant (`email → [slugs]`, enforced by `authorize`) is the editor allowlist —
+  it never lives in the public `config.json`. Grandfathered tokens (`email: null`)
+  pass on slug match alone and can't be listed/removed/renamed. `issueMagicLink`
   only mints a login link; granting is explicit (`createSite` seed,
   `POST /sites/:slug/editors`).
 - **Cloudflare provisioning** — `cfFetch`, `ensurePagesProject`, `ensureDnsRecord`,
@@ -90,11 +97,15 @@ Key helper groups (each has a `// ---` banner comment):
    and `ALLOWED_EXT` **must stay byte-identical** to `editor/.../codec.js` and
    `web-template/.../migrate.js` (see parent CLAUDE.md).
 3. **Slug** — `SLUG_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/`; reserved: `api, editor, www, data`.
-   A token is valid for a slug only if its hash maps to that **exact** slug, **and** (for
-   email-bound tokens) its bound email is in the slug's `emails.json` grant.
-4. **Timing-safe comparison** — `timingSafeEqual` for both admin hash and editor
-   token hash. `authorize`/`whoami` intentionally iterate *all* map entries with no
-   early break to avoid leaking which hash matched.
+   A token is valid for a slug only if `tokens[sha256(token)].slug` equals that
+   **exact** slug, **and** (for email-bound tokens) its bound email is in the slug's
+   `emails` grant. Grandfathered tokens (`email: null`, migrated from the legacy
+   format) pass on slug match alone — and cannot be revoked/renamed by the editor
+   endpoints.
+4. **Timing-safe comparison** — `timingSafeEqual` is still used for the admin token
+   hash (`authorizeAdmin`). Editor token lookups use a **direct** `tokens[sha256(token)]`
+   object probe rather than the old all-entries sweep: token hashes are 256-bit random,
+   so a timing side channel on a single key probe leaks nothing brute-forceable.
 5. **`.site` marker** (`SITE_MARKER = '.site'`) contains a dot, so it's outside the
    token charset and can never be written/overwritten by a client. It's skipped in
    `listFiles` and drives `/sites/list` via R2 delimited prefixes even before any
@@ -102,9 +113,16 @@ Key helper groups (each has a `// ---` banner comment):
 
 ## Notable behaviors
 
-- **`auth.json` read-modify-write races**: `createSite` reads, mutates, and writes
-  back `auth.json`, so concurrent creations can lose a hash (last write wins).
-  Acceptable — site creation is occasional admin bootstrapping, not mass-mint.
+- **`auth.enc` read-modify-write races**: every credential mutation reads, mutates,
+  and writes back the single encrypted `auth.enc`, so concurrent mutations can lose
+  an update (last write wins — R2 has no CAS here). This aggregates the old
+  per-file races into one file but is no worse per-operation; acceptable given the
+  occasional-administration workload, not mass concurrent minting.
+- **`AUTH_KEY` is the single point of failure.** `auth.enc` is the only copy of every
+  token and grant (the bucket is public and migration deletes the legacy files).
+  On decrypt failure `readAuthState` returns null → handlers 503, and migration is
+  never re-run over an existing `auth.enc`. Back `AUTH_KEY` up; the migration is
+  effectively one-way.
 - **`readFile` is defined but unrouted**: there's no `GET /sites/:slug/:token`
   handler in `fetch`; reads are public from the data host. Don't add a public read
   route without reconsidering the auth model — `readFile` already requires an

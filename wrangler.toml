@@ -12,9 +12,8 @@ workers_dev = false
 # Single R2 bucket. Everything lives here:
 #   npx wrangler r2 bucket create parroquia
 #
-#   auth.json                 — top-level credential map { "<sha256(token)>": "<slug>" }
-#   magic.json                — pending one-time magic codes { "<sha256(code)>": {slug, emailHash, exp} }
-#   emails.json               — email→slug grants { "<sha256(email)>": ["<slug>", ...] } (emails hashed)
+#   auth.enc                  — ALL credential state in ONE AES-GCM-256 blob
+#                               {emails, tokens, magic} encrypted under AUTH_KEY
 #   <slug>/<token>            — a file (token = flat URL-safe filename; clients encode
 #                               local paths by replacing / with -; see README.md)
 # Exposed in the Worker as env.CONTENT.
@@ -30,9 +29,16 @@ workers_dev = false
 #
 #   npx wrangler secret put RESEND_API_KEY          # API key for the email provider
 #   npx wrangler secret put FROM_EMAIL              # verified sender address (default no-reply@parroquia.app)
-#   npx wrangler secret put EMAIL_HASH_SECRET       # 256-bit (>=32 random bytes, hex/base64) key that
-#                                                   # keyed-hashes emails in emails.json — the bucket is
-#                                                   # public, so plain-sha256 emails would be brute-forceable
+#
+# Secret required to encrypt/decrypt the credential store (auth.enc):
+#
+#   npx wrangler secret put AUTH_KEY                # base64 of 32 random bytes -> AES-256-GCM key
+#                                                   #   generate: openssl rand -base64 32
+#                                                   # BACK THIS UP — the bucket is public and auth.enc is
+#                                                   # the only copy of every editor token/grant. Losing
+#                                                   # AUTH_KEY after migration locks all editors out.
+#                                                   # (EMAIL_HASH_SECRET was removed; emails now live
+#                                                   # recoverably inside the encrypted blob.)
 #
 # For local dev, put them in .dev.vars instead (gitignored).
 
