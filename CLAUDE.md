@@ -59,8 +59,9 @@ Request flow, in order:
    - `GET /sites/list`, `GET /sites/:slug/list` — listing (`listSlugs`/`listFiles`)
    - `POST /sites/:slug` — admin-gated site creation (`createSite`)
    - `POST /sites/:slug/magic` — open login-link issuance (`loginMagic`)
-   - `GET`/`POST`/`PATCH`/`DELETE /sites/:slug/editors` — editor-gated editor
-     management (`listEditors`/`addEditor`/`updateEditor`/`removeEditor`)
+   - `GET`/`POST`/`PATCH`/`DELETE /sites/:slug/editors` — editor management
+     gated by admin OR an editor token for the slug
+     (`listEditors`/`addEditor`/`updateEditor`/`removeEditor`)
    - `PUT`/`DELETE /sites/:slug/:token` — editor-gated writes (`putFile`/`deleteFile`)
 
 Key helper groups (each has a `// ---` banner comment):
@@ -70,7 +71,8 @@ Key helper groups (each has a `// ---` banner comment):
   plus the AES-GCM state helpers (`authKey`, `encryptState`, `decryptState`,
   `bytesToBase64`/`base64ToBytes`) for `auth.enc`. (HMAC email hashing was removed.)
 - **Auth** — `authorizeAdmin` (admin secret gate for site creation),
-  `authorize` (editor token → slug + email-grant check), and the encrypted-state
+  `authorize` (editor token → slug + email-grant check), `authorizeAdminOrEditor`
+  (admin **or** editor-token gate for the /editors roster), and the encrypted-state
   helpers `readAuthState`/`writeAuthState`/`mutateState`/`maybeMigrate`. All
   credential data lives in ONE AES-GCM-256 blob `auth.enc` at the bucket root
   (decrypted under `AUTH_KEY` to `{ emails, tokens, magic }`); it replaces the old

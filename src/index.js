@@ -132,6 +132,9 @@ export default {
       return new Response(null, { status: 204   });
     }
 
+    // Wrap the whole dispatch so an unexpected exception surfaces as a readable
+    // 500 JSON instead of Cloudflare's bare error 1101 (uncaught Worker throw).
+    try {
     // Split path into segments, then percent-decode each. Decoding must
     // happen *before* validation so encoded traversal like %2e%2e is caught
     // (it decodes to a char outside the token charset and is rejected).
@@ -239,7 +242,7 @@ export default {
       const slug = segments[1];
       if (!validateSlug(slug)) return new Response('Invalid slug', { status: 400 });
 
-      const auth = await authorize(env, slug, request);
+      const auth = await authorizeAdminOrEditor(env, slug, request);
       if (!auth.ok) return Response.json({ error: auth.error }, { status: auth.status });
 
       return addEditor(env, request, slug);
@@ -252,7 +255,7 @@ export default {
       const slug = segments[1];
       if (!validateSlug(slug)) return new Response('Invalid slug', { status: 400 });
 
-      const auth = await authorize(env, slug, request);
+      const auth = await authorizeAdminOrEditor(env, slug, request);
       if (!auth.ok) return Response.json({ error: auth.error }, { status: auth.status });
 
       return listEditors(env, slug);
@@ -261,7 +264,7 @@ export default {
       const slug = segments[1];
       if (!validateSlug(slug)) return new Response('Invalid slug', { status: 400 });
 
-      const auth = await authorize(env, slug, request);
+      const auth = await authorizeAdminOrEditor(env, slug, request);
       if (!auth.ok) return Response.json({ error: auth.error }, { status: auth.status });
 
       return removeEditor(env, request, slug);
@@ -270,7 +273,7 @@ export default {
       const slug = segments[1];
       if (!validateSlug(slug)) return new Response('Invalid slug', { status: 400 });
 
-      const auth = await authorize(env, slug, request);
+      const auth = await authorizeAdminOrEditor(env, slug, request);
       if (!auth.ok) return Response.json({ error: auth.error }, { status: auth.status });
 
       return updateEditor(env, request, slug);
@@ -303,6 +306,12 @@ export default {
     }
 
     return new Response('Not Found', { status: 404 });
+    } catch (err) {
+      return Response.json(
+        { error: 'internal error', detail: String(err?.message ?? err).slice(0, 200) },
+        { status: 500 },
+      );
+    }
   },
 };
 
@@ -682,6 +691,20 @@ async function authorize(env, slug, request) {
     return { ok: false, status: 403, error: 'email not authorized for this slug' };
   }
   return { ok: true };
+}
+
+/**
+ * Accept either the site admin secret (authorizeAdmin) or an editor token
+ * authorized for `slug` (authorize). Used by the /editors roster endpoints so
+ * the admin can manage co-editors without holding an editor token. Admin secret
+ * and editor tokens are disjoint credential spaces — a token failing one check
+ * may validly satisfy the other. Returns the passing check, else the editor
+ * check's failure result.
+ */
+async function authorizeAdminOrEditor(env, slug, request) {
+  const admin = await authorizeAdmin(env, request);
+  if (admin.ok) return admin;
+  return authorize(env, slug, request);
 }
 
 // slug-agnostic version of the same lookup authorize() does.

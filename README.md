@@ -45,10 +45,10 @@ the code ever disagree, **the code wins** and this README must be corrected.
 | GET    | `/sites/:slug/list`      | —               | `:slug` validated (see slug rules)                 | `200 { slug, files: [...] }` / `400` *(legacy alias of `/sites/:slug`)* |
 | POST   | `/sites/:slug`           | `Bearer admin`  | `:slug` validated, not reserved; body `{ "email": "<addr>" }` — provisions Cloudflare, copies the root `config.json` template into the site, grants `<email>` edit access, and emails a one-time magic link | `201 { ok, slug, sent, email }` / `400/401/403/409/502/503` |
 | POST   | `/sites/:slug/magic`     | —               | `:slug` must exist; body `{ "email": "<addr>" }` — email a one-time magic **login** link; does NOT grant access | `200 { ok, slug, sent, email }` / `400/404/502/503` |
-| POST   | `/sites/:slug/editors`   | `Bearer editor` | `:slug` must exist; body `{ "email": "<addr>" }` — grant `<email>` edit access to the slug and email an invite/login link | `200 { ok, slug, sent, email }` / `400/401/403/404/502/503` |
-| GET    | `/sites/:slug/editors`   | `Bearer editor` | `:slug` must exist — list the emails granted write access to **this** slug only | `200 { ok, slug, editors: [...] }` / `400/401/403/404/503` |
-| PATCH  | `/sites/:slug/editors`   | `Bearer editor` | `:slug` must exist; body `{ "from": "<old>", "to": "<new>" }` — change an editor's email: re-grants `to` and re-binds `from`'s tokens so existing sessions keep working | `200 { ok, slug, from, to }` / `400/401/403/404/503` |
-| DELETE | `/sites/:slug/editors`   | `Bearer editor` | `:slug` must exist; body `{ "email": "<addr>" }` — remove the editor and revoke their tokens for this slug (grandfathered tokens can't be revoked) | `200 { ok, slug, email }` / `400/401/403/404/503` |
+| POST   | `/sites/:slug/editors`   | `Bearer editor | admin` | `:slug` must exist; body `{ "email": "<addr>" }` — grant `<email>` edit access to the slug and email an invite/login link | `200 { ok, slug, sent, email }` / `400/401/403/404/502/503` |
+| GET    | `/sites/:slug/editors`   | `Bearer editor | admin` | `:slug` must exist — list the emails granted write access to **this** slug only | `200 { ok, slug, editors: [...] }` / `400/401/403/404/503` |
+| PATCH  | `/sites/:slug/editors`   | `Bearer editor | admin` | `:slug` must exist; body `{ "from": "<old>", "to": "<new>" }` — change an editor's email: re-grants `to` and re-binds `from`'s tokens so existing sessions keep working | `200 { ok, slug, from, to }` / `400/401/403/404/503` |
+| DELETE | `/sites/:slug/editors`   | `Bearer editor | admin` | `:slug` must exist; body `{ "email": "<addr>" }` — remove the editor and revoke their tokens for this slug (grandfathered tokens can't be revoked) | `200 { ok, slug, email }` / `400/401/403/404/503` |
 | POST   | `/auth/magic`            | —               | body `{ "code": "<64hex>" }` (one-time, from the email) | `200 { ok, slug, token }` / `400/404/410` |
 | POST   | `/auth/request`          | —               | body `{ "email": "<addr>" }` — email a one-time magic **login** link to every slug the address can edit (resolved server-side from the email grant); never grants access; returns a generic success either way | `200 { ok, email }` / `400/503` |
 | PUT    | `/sites/:slug/:token`    | `Bearer editor` | body = raw bytes, `Content-Type` optional          | `200 { ok, slug, key }` / `400/401/403` |
@@ -131,7 +131,8 @@ curl https://data.parroquia.app/<slug>/noticias.md
 Two capabilities:
 
 - **Admin** (`ADMIN_TOKEN_HASH`): a Worker secret holding the SHA-256 hex of the
-  admin token. It gates **only** `POST /sites/:slug`. Set with
+  admin token. It gates `POST /sites/:slug` (site creation) and the editor-roster
+  endpoints (`GET`/`POST`/`PATCH`/`DELETE /sites/:slug/editors`). Set with
   `npx wrangler secret put ADMIN_TOKEN_HASH` (prod) or in gitignored
   `.dev.vars` (local). The admin hash is never stored in the bucket.
 - **Editor** tokens: 256-bit random hex values minted on magic-link exchange
@@ -141,8 +142,9 @@ Two capabilities:
   is SHA-256-hashed and looked up as `tokens[sha256(token)] → { slug, email }`. A
   request is authorized only if that entry exists **and** its mapped slug equals
   the slug in the URL path **and** the bound email is in that slug's `emails[...]`
-  grant. Gates writes (`PUT`/`DELETE`) and all editor-management endpoints for that
-  slug. Grandfathered tokens (bound `email: null`, migrated from the pre-email
+  grant. Gates writes (`PUT`/`DELETE`) and, with the admin secret, the
+  editor-management endpoints for that slug. Grandfathered tokens (bound
+  `email: null`, migrated from the pre-email
   legacy format) are authorized on slug match alone.
 
 ### Magic-link login
@@ -167,8 +169,9 @@ and kicks off magic-link login instead:
    `sha256(token) → { slug, email }` in the decrypted state, **deletes the code**
    (single-use), and returns `{ ok, slug, token }`.
 
-**Managing co-editors** (all editor-gated to the requesting editor's own slug; write
-permission grants the ability to onboard others):
+**Managing co-editors** (gated by **either** the admin secret **or** an editor
+token valid for the requesting editor's own slug; write permission grants the
+ability to onboard others):
 
 - **List** — `GET /sites/:slug/editors` returns the granted emails for this slug
   (recoverable because they live plaintext inside the encrypted blob).
@@ -201,8 +204,8 @@ their SHA-256 and are single-use + expiring. Editor tokens are 256-bit random va
 whose stored hashes are not brute-forceable. Trade-off: `AUTH_KEY` is the **single
 point of failure** — the bucket is public and `auth.enc` is the only copy of every
 token and grant, so losing it (or a decrypt failure) locks all editors out; back it up.
-Also note `GET /editors` reveals co-editor emails to any valid token holder for that
-slug — an intended consequence of recoverable emails, scoped to one slug.
+Also note `GET /editors` reveals co-editor emails to the admin or any valid token
+holder for that slug — an intended consequence of recoverable emails, scoped to one slug.
 
 ## Token encoding
 
