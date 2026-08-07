@@ -48,7 +48,7 @@ the code ever disagree, **the code wins** and this README must be corrected.
 | POST   | `/sites/:slug/editors`   | `Bearer editor | admin` | `:slug` must exist; body `{ "email": "<addr>" }` — grant `<email>` edit access to the slug and email an invite/login link | `200 { ok, slug, sent, email }` / `400/401/403/404/502/503` |
 | GET    | `/sites/:slug/editors`   | `Bearer editor | admin` | `:slug` must exist — list the emails granted write access to **this** slug only | `200 { ok, slug, editors: [...] }` / `400/401/403/404/503` |
 | PATCH  | `/sites/:slug/editors`   | `Bearer editor | admin` | `:slug` must exist; body `{ "from": "<old>", "to": "<new>" }` — change an editor's email: re-grants `to` and re-binds `from`'s tokens so existing sessions keep working | `200 { ok, slug, from, to }` / `400/401/403/404/503` |
-| DELETE | `/sites/:slug/editors`   | `Bearer editor | admin` | `:slug` must exist; body `{ "email": "<addr>" }` — remove the editor and revoke their tokens for this slug (grandfathered tokens can't be revoked) | `200 { ok, slug, email }` / `400/401/403/404/503` |
+| DELETE | `/sites/:slug/editors`   | `Bearer editor | admin` | `:slug` must exist; body `{ "email": "<addr>" }` — remove the editor and revoke their tokens for this slug | `200 { ok, slug, email }` / `400/401/403/404/503` |
 | POST   | `/auth/magic`            | —               | body `{ "code": "<64hex>" }` (one-time, from the email) | `200 { ok, slug, token }` / `400/404/410` |
 | POST   | `/auth/request`          | —               | body `{ "email": "<addr>" }` — email a one-time magic **login** link to every slug the address can edit (resolved server-side from the email grant); never grants access; returns a generic success either way | `200 { ok, email }` / `400/503` |
 | PUT    | `/sites/:slug/:token`    | `Bearer editor` | body = raw bytes, `Content-Type` optional          | `200 { ok, slug, key }` / `400/401/403` |
@@ -143,9 +143,8 @@ Two capabilities:
   request is authorized only if that entry exists **and** its mapped slug equals
   the slug in the URL path **and** the bound email is in that slug's `emails[...]`
   grant. Gates writes (`PUT`/`DELETE`) and, with the admin secret, the
-  editor-management endpoints for that slug. Grandfathered tokens (bound
-  `email: null`, migrated from the pre-email
-  legacy format) are authorized on slug match alone.
+  editor-management endpoints for that slug. Every editor token is bound to a
+  plaintext email (there is no legacy format anymore).
 
 ### Magic-link login
 
@@ -178,9 +177,7 @@ ability to onboard others):
 - **Add** — `POST /sites/:slug/editors` grants the new email and emails an
   invite/login link. The new editor exchanges the link at `/auth/magic` for a token.
 - **Remove** — `DELETE /sites/:slug/editors` with `{ "email" }` drops the slug from
-  that email's grant and revokes its tokens for this slug. Grandfathered tokens
-  (migrated from the pre-email legacy format) have no bound email and **cannot** be
-  revoked here; a migrated editor keeps write access until they re-login via magic.
+  that email's grant and revokes that email's tokens for this slug.
 - **Rename** — `PATCH /sites/:slug/editors` with `{ "from", "to" }` re-grants the
   target email and re-binds the source's tokens to it, so the editor keeps their
   existing logged-in sessions across the address change.
@@ -247,14 +244,14 @@ Everything is a **top-level single object** (no `magic/`-style prefix), so `GET 
 (which lists R2 delimited prefixes) never surfaces a synthetic slug — neither the root
 `config.json` template nor `auth.enc` nor `slugs.json` appear under a slug prefix.
 
-`auth.enc` replaces the old public `auth.json` + `magic.json` + `emails.json`. Emails
-are stored **plaintext inside the encrypted blob** (recoverable, so the worker can
-list/remove/rename editors) rather than as irreversible HMAC digests. Tokens and magic
-codes stay keyed by their **SHA-256** for defense in depth. On first use after deploy,
-a lazy migration reads any legacy `auth.json`/`magic.json`/`emails.json`, writes the
-encrypted `auth.enc`, and deletes the legacy files. Legacy tokens become **grandfathered**
-(`email: null`): they keep write access but aren't bound to an email, so they can't be
-listed/removed/renamed by the editor endpoints, and their emails are irrecoverable.
+`auth.enc` holds all credential state. Emails are stored **plaintext inside the
+encrypted blob** (recoverable, so the worker can list/remove/rename editors) rather
+than as irreversible HMAC digests. Tokens and magic codes stay keyed by their
+**SHA-256** for defense in depth. `auth.enc` is created **lazily on the first
+authorized write** — reading before that returns an empty state, so a fresh store
+works with no `AUTH_KEY` until the first write. There is **no legacy migration**:
+the old public `auth.json`/`magic.json`/`emails.json` are never read or deleted
+(delete them manually if any remain).
 
 ## Files that must stay in sync
 
@@ -307,13 +304,13 @@ Optional non-secret var: `MAGIC_LINK_BASE` (default
 `.dev.vars`. See `wrangler.toml` comments.
 
 > **⚠️ Back up `AUTH_KEY`.** The R2 bucket is public and `auth.enc` is the only copy
-> of every editor token and grant. `EMAIL_HASH_SECRET` was removed: emails now live
-> recoverably inside the encrypted blob instead of as HMAC digests. On first request
-> after deploy, the worker migrates any legacy `auth.json`/`magic.json`/`emails.json`
-> into `auth.enc` and deletes them — **that migration is one-way**. Losing `AUTH_KEY`
-> after migration (or setting it wrong) makes `auth.enc` undecryptable and locks all
-> editors out. Verify one authorized call in staging before trusting the migration,
-> and snapshot the legacy files once if you want a fallback.
+> of every editor token and grant. Emails live recoverably inside the encrypted blob
+> (no HMAC digests). `AUTH_KEY` must be base64 of exactly 32 bytes; a missing or
+> invalid key makes `auth.enc` unencryptable, so every write returns a `503` (`auth
+> encryption key not configured`) and the credential store never gets created.
+> There is **no migration** — `auth.enc` is created lazily on the first write. The
+> worker also no longer reads or deletes legacy `auth.json`/`magic.json`/`emails.json`;
+> delete them manually if any remain in the bucket.
 
 ## GitHub
 
