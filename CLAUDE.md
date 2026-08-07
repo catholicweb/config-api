@@ -113,6 +113,15 @@ Key helper groups (each has a `// ---` banner comment):
 
 ## Notable behaviors
 
+- **Caching** — every `env.CONTENT.put` sets `httpMetadata.cacheControl` from the
+  `CACHE_*` constants: hashed media gets `public, max-age=31536000, immutable`, and
+  `LIVING_FILES` (`config.json`, `slugs.json`) get `public, max-age=0, must-revalidate`.
+  This is required because the R2 custom domain `data.parroquia.app` only caches
+  responses that carry their own Cache-Control header (else `cf-cache-status: DYNAMIC`);
+  rules in `set-cache-rules.mjs` are belt-and-suspenders. Pre-existing objects are
+  re-stamped in place by the admin-gated `POST /sites/backfill-cache` handler
+  (`backfillCache`), which re-applies the same `CACHE_*`/`LIVING_FILES` policy
+  bucket-wide. See README "Caching".
 - **`auth.enc` read-modify-write races**: every credential mutation reads, mutates,
   and writes back the single encrypted `auth.enc`, so concurrent mutations can lose
   an update (last write wins — R2 has no CAS here). This aggregates the old

@@ -51,6 +51,7 @@ the code ever disagree, **the code wins** and this README must be corrected.
 | DELETE | `/sites/:slug/editors`   | `Bearer editor | admin` | `:slug` must exist; body `{ "email": "<addr>" }` — remove the editor and revoke their tokens for this slug | `200 { ok, slug, email }` / `400/401/403/404/503` |
 | POST   | `/auth/magic`            | —               | body `{ "code": "<64hex>" }` (one-time, from the email) | `200 { ok, slug, token }` / `400/404/410` |
 | POST   | `/auth/request`          | —               | body `{ "email": "<addr>" }` — email a one-time magic **login** link to every slug the address can edit (resolved server-side from the email grant); never grants access; returns a generic success either way | `200 { ok, email }` / `400/503` |
+| POST   | `/sites/backfill-cache`  | `Bearer admin`  | — maintenance: re-stamp `Cache-Control` metadata onto every existing bucket object so `data.parroquia.app` caches them (idempotent) | `200 { ok, updated, skipped }` / `401/403/503` |
 | PUT    | `/sites/:slug/:token`    | `Bearer editor` | body = raw bytes, `Content-Type` optional          | `200 { ok, slug, key }` / `400/401/403` |
 | DELETE | `/sites/:slug/:token`    | `Bearer editor` | —                                                  | `200 { ok, slug, key }` / `400/401/403` |
 
@@ -287,6 +288,50 @@ if it is missing.
 auth**. The Worker's `/sites/:slug/list` returns which filenames exist; the byte
 content is always fetched from the data host. The editor forces cache revalidation
 and never shows stale content.
+
+### Caching
+
+`data.parroquia.app` is the R2 bucket published through a custom domain. R2 custom
+domains only serve responses as cacheable when the **object itself carries a
+`Cache-Control` header** (otherwise every read is `cf-cache-status: DYNAMIC`), so the
+Worker writes that header into every object's `httpMetadata` at save time:
+
+- **Hashed media** (`{slug}/<hashed-name>.webp`, everything that is not a *living*
+  file) → `public, max-age=31536000, immutable`. Content-hashed filenames mean a
+  change produces a new URL, so `immutable` is safe.
+- **Living files** (`config.json`, `slugs.json`) → `public, max-age=0, must-revalidate`,
+  so they never go stale.
+
+Consumers that must stay fresh already bypass this: the editor reads with
+`?_=<timestamp>` plus `fetch(..., {cache:'no-cache'})`, and `web-template` fetches
+`config.json` only at build time with `cache:'no-cache'`. Any new consumer of a
+living file should append a cache-busting query param (e.g. `?time={timestamp}`).
+
+Objects written before this caching was added carry no header (still `DYNAMIC`).
+Re-stamp the policy onto them (idempotent, admin-gated) with:
+
+```bash
+# admin bearer token — rewrites every object's Cache-Control metadata in place
+curl -X POST https://api.parroquia.app/sites/backfill-cache \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+# → { "ok": true, "updated": N, "skipped": M }
+```
+
+The Cloudflare CDN edge rules for both hosts live in `set-cache-rules.mjs`
+(`*.parroquia.app/assets/*` immutable; other files `respect_origin`). Legacy Page
+Rules were removed — Page Rules take precedence over Cache Rules and are redundant
+here. `set-page-rules.mjs --clear` keeps them removed.
+
+### Management scripts
+
+All take `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ZONE_ID` from the environment, with a
+`--dry-run`/`--list` first:
+
+- `node set-cache-rules.mjs --apply` — write the 3 Cloudflare Cache Rules
+  (media/`data.parroquia.app` and `*.parroquia.app/assets/*` immutable;
+  other site files respect origin). PUTs replace the whole phase — review with
+  `--list` first.
+- `node set-page-rules.mjs --clear` — delete all legacy Page Rules.
 
 ## Deploy & secrets
 
