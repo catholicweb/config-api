@@ -52,13 +52,17 @@ the code ever disagree, **the code wins** and this README must be corrected.
 | POST   | `/auth/magic`            | —               | body `{ "code": "<64hex>" }` (one-time, from the email) | `200 { ok, slug, token }` / `400/404/410` |
 | POST   | `/auth/request`          | —               | body `{ "email": "<addr>" }` — email a one-time magic **login** link to every slug the address can edit (resolved server-side from the email grant); never grants access; returns a generic success either way | `200 { ok, email }` / `400/503` |
 | POST   | `/sites/backfill-cache`  | `Bearer admin`  | — maintenance: re-stamp `Cache-Control` metadata onto every existing bucket object so `data.parroquia.app` caches them (idempotent) | `200 { ok, updated, skipped }` / `401/403/503` |
-| PUT    | `/sites/:slug/:token`    | `Bearer editor` | body = raw bytes, `Content-Type` optional          | `200 { ok, slug, key }` / `400/401/403` |
+| PUT    | `/sites/:slug/:token`    | `Bearer editor` | body = raw bytes, `Content-Type` optional. Writing `config.json` also triggers an automatic page build (best-effort, see [Auto-build](#auto-build)) | `200 { ok, slug, key }` / `400/401/403` |
 | DELETE | `/sites/:slug/:token`    | `Bearer editor` | —                                                  | `200 { ok, slug, key }` / `400/401/403` |
 
 **Reserved slugs** (rejected on site creation): `api`, `editor`, `www`, `data`.
 
-Slug rules: single path segment, no dots/slashes, cannot start with `-` or `_`
-(`SLUG_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/`).
+Slug rules: single path segment, lowercase `[a-z0-9]` with optional internal
+hyphens, 1–63 chars, no leading/trailing hyphen, no dots/slashes/underscores
+(`SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/`). Slugs are deployed as
+subdomains (`{slug}.parroquia.app`), and DNS is case-insensitive and cannot contain
+`_` — this format is what the auto-build workflow accepts and prevents URL-equivalent
+collisions.
 
 ### Examples (curl)
 
@@ -279,7 +283,7 @@ the old public `auth.json`/`magic.json`/`emails.json` are never read or deleted
 
 | File                 | Depends on                          |
 |----------------------|--------------------------------------|
-| `config-api/src/index.js` | validation (`FILENAME_RE`, `ALLOWED_EXT`), endpoint definitions |
+| `config-api/src/index.js` | validation (`FILENAME_RE`, `ALLOWED_EXT`), endpoint definitions (_`SLUG_RE` is **not** cross-repo-synced — it is intentionally stricter than `migrate.js` and subdomain-safe_) |
 | `editor/.../theme/lib/codec.js` | token encode/validate |
 | `editor/.../theme/lib/api.js` | endpoint definitions, auth headers |
 | `web-template/.../migrate.js` | token encode/validate, endpoint definitions, R2 layout |
@@ -343,6 +347,24 @@ The Cloudflare CDN edge rules for both hosts live in `set-cache-rules.mjs`
 Rules were removed — Page Rules take precedence over Cache Rules and are redundant
 here. `set-page-rules.mjs --clear` keeps them removed.
 
+### Auto-build
+
+Whenever a site's `config.json` is written — via `PUT /sites/:slug/config.json`, or
+on site creation (`POST /sites/:slug`, which seeds `<slug>/config.json`) — the worker
+best-effort dispatches the deploy workflow `catholicweb/web-template:deploy.yml`
+(which accepts the site slug as its required `site_slug` input, then builds + deploys
+the page to Cloudflare Pages).
+
+The dispatch is **fire-and-forget**: the save/create response is returned
+immediately (200/201) regardless of the dispatch outcome. A failure (e.g. missing
+token, GitHub error, rate limit) is logged and never blocks the editor. If
+`GITHUB_BUILD_TOKEN` is not set, the feature is simply off and nothing is dispatched.
+
+Requires the `GITHUB_BUILD_TOKEN` secret (see [Deploy & secrets](#deploy--secrets)) on
+the worker side, and on the GitHub side the `deploy.yml` workflow must keep exposing
+its required `site_slug` input on `workflow_dispatch` — no other workflow change is
+needed.
+
 ### Management scripts
 
 All take `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ZONE_ID` from the environment, with a
@@ -365,6 +387,12 @@ Required secrets (set via `wrangler secret put`): `ADMIN_TOKEN_HASH`,
 `RESEND_API_KEY` (email delivery), `FROM_EMAIL` (verified sender; defaults to
 `no-reply@parroquia.app`), `AUTH_KEY` (base64 of 32 random bytes — the AES-256-GCM
 key that encrypts/decrypts `auth.enc`; generate with `openssl rand -base64 32`).
+
+**Optional** secret: `GITHUB_BUILD_TOKEN` — a fine-grained PAT, scoped to ONLY
+`catholicweb/web-template` with `Actions: read and write` (classic PATs need broad
+`repo` scope; not recommended). Enables [Auto-build](#auto-build) on `config.json`
+writes; when unset the feature is off and saves still work.
+
 Optional non-secret var: `MAGIC_LINK_BASE` (default
 `https://editor.parroquia.app/magic`). For local dev, put them in gitignored
 `.dev.vars`. See `wrangler.toml` comments.

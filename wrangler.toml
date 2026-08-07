@@ -41,6 +41,13 @@ workers_dev = false
 #                                                   # emails now live recoverably inside the encrypted blob.
 #                                                   # No migration: auth.enc is created lazily on first write.)
 #
+# Optional secret for auto-build (dispatches web-template's deploy workflow when a
+# site's config.json is written). If unset, the feature is off and saves still work:
+#
+#   npx wrangler secret put GITHUB_BUILD_TOKEN      # fine-grained PAT, Actions: read and write
+#                                                   # on catholicweb/web-template ONLY (least privilege).
+#                                                   # A classic PAT with broad repo scope is NOT recommended.
+#
 # For local dev, put them in .dev.vars instead (gitignored).
 
 # Non-secret: where the emailed magic link points (the editor magic-link landing
