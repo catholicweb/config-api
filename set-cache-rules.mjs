@@ -4,6 +4,15 @@
  * a zone that serves multiple VitePress subdomains + one hashed-media
  * subdomain (data.parroquia.app).
  *
+ * NOTE: for the R2-backed data.parroquia.app host these rules alone are NOT
+ * enough — R2 custom domains only serve cacheable responses when the object
+ * itself carries a Cache-Control header (set at write time in src/index.js via
+ * httpMetadata.cacheControl, and re-stamped over existing objects by the admin
+ * POST /sites/backfill-cache handler). The data.parroquia.app rule here is
+ * belt-and-suspenders; the write-path metadata is the actual fix. The
+ * *.parroquia.app rules tune the VitePress Pages sites (hashed assets immutable,
+ * other files respect origin).
+ *
  * WARNING: PUTting to the entrypoint REPLACES all rules currently in this
  * phase for the zone. Run with --dry-run first, or with --list to see what's
  * there today, before applying.
@@ -115,14 +124,16 @@ const rules = [
   },
   {
     ref: "site_html_short_ttl",
-    description: "Site subdomains: HTML (and everything outside /assets/) — short TTL, must revalidate",
+    description: "Site subdomains: HTML (and everything outside /assets/) — respect origin, must revalidate",
     expression: `(http.host ne "${MEDIA_HOSTNAME}" and not http.request.uri.path contains "/assets/")`,
     action: "set_cache_settings",
     action_parameters: {
       cache: true,
+      // For the VitePress Pages sites the origin already sends `max-age=0, must-revalidate`
+      // on HTML, so respect_origin keeps new deploys visible instantly while still caching
+      // at the edge for revalidation. Overriding the edge TTL would delay deploys.
       edge_ttl: {
-        mode: "override_origin",
-        default: 300, // 5 min — tune down further, or to 0, if you want deploys to show up instantly
+        mode: "respect_origin",
       },
       browser_ttl: {
         mode: "respect_origin",

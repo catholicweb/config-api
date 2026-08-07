@@ -1,7 +1,13 @@
 #!/usr/bin/env node
 /**
- * Configure Cloudflare Page Rules for caching (Free plan compatible).
- * Page Rules are limited to 3 on the Free plan.
+ * Manage Cloudflare Page Rules for caching (Free plan compatible, max 3 rules).
+ *
+ * Page Rules are a legacy mechanism that takes PRECEDENCE over Cache Rules and
+ * has a free-plan quota of 3, so the cache-control setup for parroquia.app has
+ * moved to Cloudflare Cache Rules (see set-cache-rules.mjs) plus object-level
+ * Cache-Control on the R2 bucket (set at write time, re-stamped via the admin
+ * POST /sites/backfill-cache endpoint). This script's rules below are kept for
+ * reference only; the applied end-state is ZERO page rules.
  *
  * Env vars required:
  *   CLOUDFLARE_API_TOKEN   - token with Zone > Page Rules > Edit permission
@@ -9,8 +15,9 @@
  *
  * Usage:
  *   node set-page-rules.mjs --list        # show current rules
- *   node set-page-rules.mjs --dry-run     # print the payload
- *   node set-page-rules.mjs --apply       # actually create the rules
+ *   node set-page-rules.mjs --clear       # DELETE all existing page rules
+ *   node set-page-rules.mjs --dry-run     # print the (reference) payload
+ *   node set-page-rules.mjs --apply       # create the reference rules (not recommended)
  */
 
 const TOKEN = process.env.CLOUDFLARE_API_TOKEN?.trim();
@@ -90,6 +97,17 @@ async function main() {
   if (mode === "--list") {
     const current = await cfFetch("GET");
     console.log(JSON.stringify(current, null, 2));
+  } else if (mode === "--clear") {
+    const existing = await cfFetch("GET");
+    if (existing.length === 0) {
+      console.log("No page rules to delete.");
+      return;
+    }
+    for (const rule of existing) {
+      await cfFetch("DELETE", rule.id);
+      console.log(`Deleted page rule ${rule.id} (${rule.targets?.[0]?.constraint?.value ?? ''})`);
+    }
+    console.log(`Removed ${existing.length} page rule(s). Zone now relies on Cache Rules.`);
   } else if (mode === "--dry-run") {
     console.log(JSON.stringify({ rules }, null, 2));
   } else if (mode === "--apply") {
@@ -108,7 +126,7 @@ async function main() {
     const updated = await cfFetch("GET");
     console.log(JSON.stringify(updated, null, 2));
   } else {
-    console.log("Usage: node set-page-rules.mjs [--list|--dry-run|--apply]");
+    console.log("Usage: node set-page-rules.mjs [--list|--clear|--dry-run|--apply]");
   }
 }
 

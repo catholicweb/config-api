@@ -189,6 +189,16 @@ export default {
       return new Response('Not Found', { status: 404 });
     }
 
+    // POST /sites/backfill-cache — admin-gated maintenance: re-stamp
+    // Cache-Control onto every existing bucket object so data.parroquia.app serves
+    // them cacheable. Must match BEFORE the generic POST /sites/:slug (createSite)
+    // below, which would otherwise treat 'backfill-cache' as a slug to create.
+    if (method === 'POST' && segments.length === 2 && segments[1] === 'backfill-cache') {
+      const admin = await authorizeAdmin(env, request);
+      if (!admin.ok) return Response.json({ error: admin.error }, { status: admin.status });
+      return backfillCache(env);
+    }
+
     // GET /sites — list all slugs
     if (method === 'GET' && segments.length === 1) {
       return listSlugs(env);
@@ -541,7 +551,7 @@ async function writeAuthState(env, state) {
     return { ok: false, error: 'auth encryption key not configured (AUTH_KEY not set or invalid)' };
   }
   await env.CONTENT.put(AUTH_FILE, JSON.stringify(blob), {
-    httpMetadata: { contentType: 'application/json' },
+    httpMetadata: { contentType: 'application/json', cacheControl: CACHE_REVALIDATE },
   });
   return { ok: true, error: null };
 }
@@ -600,7 +610,7 @@ async function authorizeAdmin(env, request) {
 // Write a top-level JSON object store back to R2.
 async function writeJsonMap(env, key, map) {
   await env.CONTENT.put(key, JSON.stringify(map), {
-    httpMetadata: { contentType: 'application/json' },
+    httpMetadata: { contentType: 'application/json', cacheControl: CACHE_REVALIDATE },
   });
 }
 
@@ -807,6 +817,17 @@ const MAGIC_TTL_MS = 15 * 60 * 1000;
 const AUTH_FILE = 'auth.enc';
 const AUTH_STATE_V = 1; // encrypted-blob format version
 
+// Cache-Control policies written into every object's httpMetadata. The bucket is
+// published read-only at data.parroquia.app (R2 custom domain), which only treats
+// responses as cacheable when the object itself carries Cache-Control — a header the
+// R2 host will not add on its own, so without this every read is cf-cache-status:
+// DYNAMIC. Hashed media (content-hashed filename → new URL per change) is safe to
+// mark immutable; "living" files (config.json, slugs.json) must revalidate so they
+// never go stale for a whole year, and any non-busted consumer still gets fresh data.
+const CACHE_IMMUTABLE = 'public, max-age=31536000, immutable';
+const CACHE_REVALIDATE = 'public, max-age=0, must-revalidate';
+const LIVING_FILES = new Set(['config.json', 'slugs.json']);
+
 /**
  * List all slugs by scanning the R2 bucket for top-level "folders".
  * Returns a bare `string[]` of slug names. This is the authoritative source;
@@ -924,7 +945,7 @@ async function createSite(env, slug, email) {
   }
   const templateText = await template.text();
   await env.CONTENT.put(`${slug}/config.json`, templateText, {
-    httpMetadata: { contentType: 'application/json' },
+    httpMetadata: { contentType: 'application/json', cacheControl: CACHE_REVALIDATE },
   });
 
   // Grant the owner editor access (the encrypted email allowlist is the enforced
@@ -938,7 +959,7 @@ async function createSite(env, slug, email) {
   }
 
   await env.CONTENT.put(`${slug}/${SITE_MARKER}`, '{"ok":true}', {
-    httpMetadata: { contentType: 'application/json' },
+    httpMetadata: { contentType: 'application/json', cacheControl: CACHE_REVALIDATE },
   });
 
   // Write the authoritative slugs.json at the bucket root (same shape as the
@@ -1344,10 +1365,52 @@ async function putFile(env, slug, token, request) {
   }
   const contentType =
     request.headers.get('Content-Type') || 'application/octet-stream';
+  // Client-generated media uses content-hashed filenames (a change → new URL), so
+  // non-config files are safe to serve immutable from data.parroquia.app. config.json
+  // (and any other living file) revalidates instead. Consumers that must stay fresh
+  // already cache-bust with a ?_=/?time query param or cache:no-cache.
+  const cacheControl = LIVING_FILES.has(token) ? CACHE_REVALIDATE : CACHE_IMMUTABLE;
   await env.CONTENT.put(key, request.body, {
-    httpMetadata: { contentType },
+    httpMetadata: { contentType, cacheControl },
   });
   return Response.json({ ok: true, slug, key }, { status: 200 });
+}
+
+// Admin-gated maintenance: rewrite every object's httpMetadata.cacheControl so the
+// whole bucket is served cacheable from data.parroquia.app. Objects written before
+// the write-path caching existed carry no Cache-Control (so R2 serves them DYNAMIC);
+// this re-stamps the same policy in place for consistent behavior. auth.enc is
+// skipped (private credential blob, never served by the data host).
+async function backfillCache(env) {
+  let cursor;
+  let updated = 0;
+  let skipped = 0;
+  do {
+    const listed = await env.CONTENT.list({ cursor, limit: 1000 });
+    for (const obj of listed.objects) {
+      const key = obj.key;
+      if (key === AUTH_FILE) {
+        skipped += 1;
+        continue;
+      }
+      const base = key.split('/').pop();
+      const cacheControl = LIVING_FILES.has(base) ? CACHE_REVALIDATE : CACHE_IMMUTABLE;
+      const existing = await env.CONTENT.get(key);
+      if (!existing) {
+        skipped += 1;
+        continue;
+      }
+      await env.CONTENT.put(key, existing.body, {
+        httpMetadata: {
+          contentType: existing.httpMetadata?.contentType ?? undefined,
+          cacheControl,
+        },
+      });
+      updated += 1;
+    }
+    cursor = listed.truncated ? listed.cursor : undefined;
+  } while (cursor);
+  return Response.json({ ok: true, updated, skipped }, { status: 200 });
 }
 
 // Delete one file by token (editor-authed). Token is used verbatim as the key.
