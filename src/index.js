@@ -86,11 +86,16 @@
  *   DELETE /sites/:slug/editors     — remove an editor + revoke their slug tokens (body { email })
  *
  * Two distinct capabilities:
- *   - ADMIN_TOKEN_HASH (Worker secret, never in the bucket): gates site creation.
+ *   - ADMIN_TOKEN_HASH (Worker secret, never in the bucket): authenticates as admin.
  *     Set with `wrangler secret put ADMIN_TOKEN_HASH` (prod) or `.dev.vars` (local).
  *   - per-slug editor tokens (256-bit random, stored as SHA-256 in the encrypted
  *     state): gate writes for that slug only. Tokens are minted via the magic-link
  *     exchange (POST /auth/magic), not returned directly at site creation.
+ *
+ * Site creation (POST /sites/:slug) accepts EITHER capability: the admin secret, or
+ * an editor token valid for any slug the caller can edit (authorizeAdminOrEditorAny).
+ * It is the only endpoint whose "editor" check is slug-agnostic — the new slug
+ * doesn't exist yet, so the caller's own bound slug stands in for it.
  *
  * SINGLE ENCRYPTED CREDENTIAL STORE (the bucket is PUBLIC, but all credential data
  * is encrypted at rest in one blob, so it is never readable without AUTH_KEY):
@@ -205,7 +210,7 @@ export default {
       return listFiles(env, slug);
     }
 
-    // POST /sites/:slug — create a site (gated by admin secret)
+    // POST /sites/:slug — create a site (gated by admin secret OR any editor token)
     if (method === 'POST' && segments.length === 2) {
       const slug = segments[1];
       if (!validateSlug(slug)) return new Response('Invalid slug', { status: 400 });
@@ -213,8 +218,8 @@ export default {
         return Response.json({ ok: false, error: 'slug is reserved' }, { status: 400 });
       }
 
-      const admin = await authorizeAdmin(env, request);
-      if (!admin.ok) return Response.json({ error: admin.error }, { status: admin.status });
+      const auth = await authorizeAdminOrEditorAny(env, request);
+      if (!auth.ok) return Response.json({ error: auth.error }, { status: auth.status });
 
       const body = await readJsonBody(request);
       if (!body.ok) return Response.json({ error: body.error }, { status: 400 });
@@ -643,6 +648,40 @@ async function authorizeAdminOrEditor(env, slug, request) {
   const admin = await authorizeAdmin(env, request);
   if (admin.ok) return admin;
   return authorize(env, slug, request);
+}
+
+/**
+ * Accept either the site admin secret (authorizeAdmin) or a valid editor token for
+ * ANY slug the caller can currently edit. Opens site creation (POST /sites/:slug)
+ * to logged-in editors, not just the admin.
+ *
+ * Unlike the slug-scoped authorizeAdminOrEditor — which pins the token to the URL
+ * slug — this is slug-agnostic: the NEW slug doesn't exist yet, so there is no URL
+ * slug to match. A token qualifies if it resolves to an email-bound entry whose
+ * email's grant list contains the token's own bound slug (i.e. the caller is
+ * currently an authorized editor of at least one site, per the same grant check
+ * authorize() applies). Email-less defensive tokens and non-editor tokens fail.
+ */
+async function authorizeAdminOrEditorAny(env, request) {
+  const admin = await authorizeAdmin(env, request);
+  if (admin.ok) return admin;
+
+  const token = bearerToken(request);
+  if (!token) return { ok: false, status: 401, error: 'missing bearer token' };
+
+  const tokenHash = await sha256Hex(token);
+  const state = await readAuthState(env);
+  if (!state) return { ok: false, status: 503, error: 'auth state unavailable' };
+
+  const entry = state.tokens[tokenHash];
+  if (!entry || entry.email == null) {
+    return { ok: false, status: 403, error: 'admin token or valid editor token required' };
+  }
+  const slugs = state.emails[entry.email] || [];
+  if (!slugs.includes(entry.slug)) {
+    return { ok: false, status: 403, error: 'admin token or valid editor token required' };
+  }
+  return { ok: true };
 }
 
 // slug-agnostic version of the same lookup authorize() does.

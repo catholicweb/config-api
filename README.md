@@ -43,7 +43,7 @@ the code ever disagree, **the code wins** and this README must be corrected.
 | GET    | `/sites/:slug`           | —               | `:slug` validated (see slug rules)                 | `200 { slug, files: [...] }` / `400` |
 | GET    | `/sites/list`            | —               | —                                                  | `200 { slugs: [...] }` *(legacy alias of `/sites`)* |
 | GET    | `/sites/:slug/list`      | —               | `:slug` validated (see slug rules)                 | `200 { slug, files: [...] }` / `400` *(legacy alias of `/sites/:slug`)* |
-| POST   | `/sites/:slug`           | `Bearer admin`  | `:slug` validated, not reserved; body `{ "email": "<addr>" }` — provisions Cloudflare, copies the root `config.json` template into the site, grants `<email>` edit access, and emails a one-time magic link | `201 { ok, slug, sent, email }` / `400/401/403/409/502/503` |
+| POST   | `/sites/:slug`           | `Bearer admin | editor` | `:slug` validated, not reserved; body `{ "email": "<addr>" }` — open to the admin or any editor who can edit at least one slug; provisions Cloudflare, copies the root `config.json` template into the site, grants `<email>` edit access, and emails a one-time magic link | `201 { ok, slug, sent, email }` / `400/401/403/409/502/503` |
 | POST   | `/sites/:slug/magic`     | —               | `:slug` must exist; body `{ "email": "<addr>" }` — email a one-time magic **login** link; does NOT grant access | `200 { ok, slug, sent, email }` / `400/404/502/503` |
 | POST   | `/sites/:slug/editors`   | `Bearer editor | admin` | `:slug` must exist; body `{ "email": "<addr>" }` — grant `<email>` edit access to the slug and email an invite/login link | `200 { ok, slug, sent, email }` / `400/401/403/404/502/503` |
 | GET    | `/sites/:slug/editors`   | `Bearer editor | admin` | `:slug` must exist — list the emails granted write access to **this** slug only | `200 { ok, slug, editors: [...] }` / `400/401/403/404/503` |
@@ -73,11 +73,19 @@ curl https://api.parroquia.app/sites
 curl https://api.parroquia.app/sites/<slug>
 # Legacy aliases still work: /sites/list and /sites/<slug>/list
 
-# Create a site (admin only) — provisions Cloudflare, copies the root config.json
-# template into the site, grants <email> edit access, and emails a one-time magic
-# link. No token is returned; the owner exchanges the link for an editor token.
+# Create a site (admin or any editor who can edit a slug) — provisions Cloudflare,
+# copies the root config.json template into the site, grants <email> edit access,
+# and emails a one-time magic link. No token is returned; the owner exchanges the
+# link for an editor token.
 curl -X POST \
   -H "Authorization: Bearer <ADMIN_TOKEN>" \
+  -H "Content-Type: application/json" \
+  --data '{"email":"owner@example.com"}' \
+  https://api.parroquia.app/sites/<slug>
+# An editor can create a site too — any editor token works; the site owner is the
+# body email, just like the admin path.
+curl -X POST \
+  -H "Authorization: Bearer <EDITOR_TOKEN>" \
   -H "Content-Type: application/json" \
   --data '{"email":"owner@example.com"}' \
   https://api.parroquia.app/sites/<slug>
@@ -131,8 +139,10 @@ curl https://data.parroquia.app/<slug>/noticias.md
 Two capabilities:
 
 - **Admin** (`ADMIN_TOKEN_HASH`): a Worker secret holding the SHA-256 hex of the
-  admin token. It gates `POST /sites/:slug` (site creation) and the editor-roster
-  endpoints (`GET`/`POST`/`PATCH`/`DELETE /sites/:slug/editors`). Set with
+  admin token. It authenticates as admin for site creation (`POST /sites/:slug`)
+  and the editor-roster endpoints (`GET`/`POST`/`PATCH`/`DELETE
+  /sites/:slug/editors`) — accepted either on its own or alongside an editor token
+  (no endpoint is admin-exclusive). Set with
   `npx wrangler secret put ADMIN_TOKEN_HASH` (prod) or in gitignored
   `.dev.vars` (local). The admin hash is never stored in the bucket.
 - **Editor** tokens: 256-bit random hex values minted on magic-link exchange
@@ -143,15 +153,19 @@ Two capabilities:
   request is authorized only if that entry exists **and** its mapped slug equals
   the slug in the URL path **and** the bound email is in that slug's `emails[...]`
   grant. Gates writes (`PUT`/`DELETE`) and, with the admin secret, the
-  editor-management endpoints for that slug. Every editor token is bound to a
-  plaintext email (there is no legacy format anymore).
+  editor-management endpoints for that slug. An editor token valid for **any** slug
+  also authorizes `POST /sites/:slug` (site creation), so a logged-in editor can
+  create new sites; the new site's owner is the body `{ "email" }`, same as the
+  admin path. Every editor token is bound to a plaintext email (there is no legacy
+  format anymore).
 
 ### Magic-link login
 
 `POST /sites/:slug` no longer returns a token. It takes the **site owner's email**
 and kicks off magic-link login instead:
 
-1. The admin authenticates with `ADMIN_TOKEN_HASH` and provides `{ "email" }`.
+1. The caller authenticates with `ADMIN_TOKEN_HASH` (admin) or a token valid for
+   any slug they can edit (editor) and provides `{ "email" }`.
 2. The worker provisions Cloudflare resources (as before), **copies the bucket-root
    `config.json` template into `<slug>/config.json`** as the site's initial content,
    **grants `<email>` edit access** in the encrypted email allowlist, and creates a
@@ -203,6 +217,13 @@ point of failure** — the bucket is public and `auth.enc` is the only copy of e
 token and grant, so losing it (or a decrypt failure) locks all editors out; back it up.
 Also note `GET /editors` reveals co-editor emails to the admin or any valid token
 holder for that slug — an intended consequence of recoverable emails, scoped to one slug.
+
+Finally, site creation (`POST /sites/:slug`) provisions real Cloudflare resources
+(Pages project, DNS CNAME, custom domain — requires `CLOUDFLARE_*` secrets) and
+emails a magic link to the body `email`. Opening it to any authenticated editor
+means any editor can mint new sites and email invites to arbitrary addresses — an
+intended widening of the capability boundary, but worth knowing before granting
+editor access to untrusted users.
 
 ## Token encoding
 

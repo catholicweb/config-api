@@ -70,10 +70,12 @@ Key helper groups (each has a `// ---` banner comment):
 - **Crypto** — `sha256Hex`, `generateToken`, `timingSafeEqual`, `bearerToken`,
   plus the AES-GCM state helpers (`authKey`, `encryptState`, `decryptState`,
   `bytesToBase64`/`base64ToBytes`) for `auth.enc`. (HMAC email hashing was removed.)
-- **Auth** — `authorizeAdmin` (admin secret gate for site creation),
-  `authorize` (editor token → slug + email-grant check), `authorizeAdminOrEditor`
-  (admin **or** editor-token gate for the /editors roster), and the encrypted-state
-  helpers `readAuthState`/`writeAuthState`/`mutateState`. All
+- **Auth** — `authorizeAdmin` (admin secret check), `authorize` (editor token →
+  slug + email-grant check), `authorizeAdminOrEditor` (admin **or** editor-token
+  gate for the /editors roster), `authorizeAdminOrEditorAny` (admin **or** any
+  valid editor token — slug-agnostic gate for site creation `POST /sites/:slug`),
+  and the encrypted-state helpers `readAuthState`/`writeAuthState`/`mutateState`.
+  All
   credential data lives in ONE AES-GCM-256 blob `auth.enc` at the bucket root
   (decrypted under `AUTH_KEY` to `{ emails, tokens, magic }`), created lazily on
   the first write. Editor tokens are bound to a plaintext
