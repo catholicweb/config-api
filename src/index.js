@@ -124,7 +124,7 @@
  */
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     let url;
     try {
       url = new URL(request.url);
@@ -239,7 +239,7 @@ export default {
         return Response.json({ error: 'a valid email is required' }, { status: 400 });
       }
 
-      return createSite(env, slug, email);
+      return createSite(ctx, env, slug, email);
     }
 
     // POST /sites/:slug/magic — issue a magic login link to an existing slug.
@@ -306,7 +306,7 @@ export default {
       const auth = await authorize(env, slug, request);
       if (!auth.ok) return Response.json({ error: auth.error }, { status: auth.status });
 
-      return putFile(env, slug, token, request);
+      return putFile(ctx, env, slug, token, request);
     }
 
     // DELETE /sites/:slug/:token — delete a file (editor-authed)
@@ -339,7 +339,11 @@ export default {
 // Slug = single path segment, no dots/slashes, can't start with `_` or `-`.
 // It selects the write-target prefix and is matched against auth.json's
 // mapped slug, so it must be a bare identifier.
-const SLUG_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
+// Slugs become subdomains ({slug}.parroquia.app): DNS is case-insensitive and
+// hostnames cannot contain `_`, so only lowercase alnum + internal hyphens are
+// allowed (no leading/trailing hyphen, 1-63 chars). This is a strict subset of the
+// deploy workflow's slug check and prevents URL-equivalent subdomain collisions.
+const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
 // Slugs that must not be used as site names because they conflict with
 // existing DNS records or planned service endpoints under parroquia.app.
@@ -734,6 +738,44 @@ async function cfFetch(env, path, options = {}) {
 }
 
 /**
+ * Dispatch the web-template deploy workflow for one slug (best-effort).
+ * Returns `{ ok: true }` on success; returns `{ ok: false }` and logs on any
+ * failure. Never throws. Unlike cfFetch, the success response here is HTTP 204
+ * with NO body, so we must NOT call res.json() on it.
+ */
+async function githubDispatch(env, slug) {
+  const token = env.GITHUB_BUILD_TOKEN;
+  if (!token) {
+    console.log(
+      'githubDispatch: GITHUB_BUILD_TOKEN not configured; skipping build trigger',
+    );
+    return { ok: false };
+  }
+  const res = await fetch(
+    `https://api.github.com/repos/${BUILD_REPO}/actions/workflows/${BUILD_WORKFLOW}/dispatches`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: 'application/vnd.github+json',
+        'Content-Type': 'application/json',
+        'X-GitHub-Api-Version': '2022-11-28',
+      },
+      body: JSON.stringify({ ref: BUILD_REF, inputs: { site_slug: slug } }),
+    },
+  );
+  if (res.status === 204) return { ok: true };
+  // Body may be present on errors; read it defensively (can be non-JSON), and
+  // never echo the token.
+  let detail = '';
+  try {
+    detail = await res.text();
+  } catch {}
+  console.log(`githubDispatch: dispatch failed (${res.status}) ${detail}`);
+  return { ok: false };
+}
+
+/**
  * Ensure a Cloudflare Pages project named `slug` exists.
  * Creates it if missing; returns `{ ok, error? }`.
  */
@@ -828,6 +870,13 @@ const CACHE_IMMUTABLE = 'public, max-age=31536000, immutable';
 const CACHE_REVALIDATE = 'public, max-age=0, must-revalidate';
 const LIVING_FILES = new Set(['config.json', 'slugs.json']);
 
+// Auto-build: where to dispatch the deploy workflow when a site's config.json is
+// written. The workflow (web-template/.github/workflows/deploy.yml) accepts a
+// required `site_slug` input, then builds + deploys the page to Cloudflare Pages.
+const BUILD_REPO = 'catholicweb/web-template';
+const BUILD_WORKFLOW = 'deploy.yml'; // filename in that repo's .github/workflows/
+const BUILD_REF = 'main';
+
 /**
  * List all slugs by scanning the R2 bucket for top-level "folders".
  * Returns a bare `string[]` of slug names. This is the authoritative source;
@@ -891,7 +940,7 @@ function addEmailGrant(state, email, slug) {
  * wins). This API is meant for occasional admin bootstrapping, not concurrent
  * mass-creation.
  */
-async function createSite(env, slug, email) {
+async function createSite(ctx, env, slug, email) {
   if (!env.RESEND_API_KEY) {
     return Response.json(
       { ok: false, error: 'magic-link email not configured (RESEND_API_KEY not set)' },
@@ -947,6 +996,13 @@ async function createSite(env, slug, email) {
   await env.CONTENT.put(`${slug}/config.json`, templateText, {
     httpMetadata: { contentType: 'application/json', cacheControl: CACHE_REVALIDATE },
   });
+
+  // Auto-build: a freshly-created site should build right away. Placed right after
+  // the config seed so it fires even if a later step (email/marker/slugs.json)
+  // fails — a fresh site's build is harmless and the seed is what matters.
+  if (ctx?.waitUntil) {
+    ctx.waitUntil(githubDispatch(env, slug));
+  }
 
   // Grant the owner editor access (the encrypted email allowlist is the enforced
   // allowlist) and email them their first login link.
@@ -1358,7 +1414,7 @@ async function readFile(env, slug, token, request) {
 }
 
 // Write one file by token (editor-authed). Token is used verbatim as the key.
-async function putFile(env, slug, token, request) {
+async function putFile(ctx, env, slug, token, request) {
   const key = `${slug}/${token}`;
   if (!key.startsWith(`${slug}/`)) {
     return new Response('Invalid path', { status: 400 });
@@ -1373,6 +1429,12 @@ async function putFile(env, slug, token, request) {
   await env.CONTENT.put(key, request.body, {
     httpMetadata: { contentType, cacheControl },
   });
+  // Auto-build: whenever a site's config.json is saved, trigger a page build
+  // (best-effort, fire-and-forget via waitUntil so the save is never blocked or
+  // failed by a dispatch problem).
+  if (token === 'config.json' && ctx?.waitUntil) {
+    ctx.waitUntil(githubDispatch(env, slug));
+  }
   return Response.json({ ok: true, slug, key }, { status: 200 });
 }
 
