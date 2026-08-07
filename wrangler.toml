@@ -35,10 +35,11 @@ workers_dev = false
 #   npx wrangler secret put AUTH_KEY                # base64 of 32 random bytes -> AES-256-GCM key
 #                                                   #   generate: openssl rand -base64 32
 #                                                   # BACK THIS UP — the bucket is public and auth.enc is
-#                                                   # the only copy of every editor token/grant. Losing
-#                                                   # AUTH_KEY after migration locks all editors out.
-#                                                   # (EMAIL_HASH_SECRET was removed; emails now live
-#                                                   # recoverably inside the encrypted blob.)
+#                                                   # the only copy of every editor token/grant. A missing
+#                                                   # or invalid key means every write returns 503 and the
+#                                                   # store never encrypts. (EMAIL_HASH_SECRET was removed;
+#                                                   # emails now live recoverably inside the encrypted blob.
+#                                                   # No migration: auth.enc is created lazily on first write.)
 #
 # For local dev, put them in .dev.vars instead (gitignored).
 

@@ -73,14 +73,13 @@ Key helper groups (each has a `// ---` banner comment):
 - **Auth** — `authorizeAdmin` (admin secret gate for site creation),
   `authorize` (editor token → slug + email-grant check), `authorizeAdminOrEditor`
   (admin **or** editor-token gate for the /editors roster), and the encrypted-state
-  helpers `readAuthState`/`writeAuthState`/`mutateState`/`maybeMigrate`. All
+  helpers `readAuthState`/`writeAuthState`/`mutateState`. All
   credential data lives in ONE AES-GCM-256 blob `auth.enc` at the bucket root
-  (decrypted under `AUTH_KEY` to `{ emails, tokens, magic }`); it replaces the old
-  `auth.json`/`magic.json`/`emails.json`. Editor tokens are bound to a plaintext
+  (decrypted under `AUTH_KEY` to `{ emails, tokens, magic }`), created lazily on
+  the first write. Editor tokens are bound to a plaintext
   email (`tokens[sha256(token)] = { slug, email }`); the **recoverable** `emails`
   grant (`email → [slugs]`, enforced by `authorize`) is the editor allowlist —
-  it never lives in the public `config.json`. Grandfathered tokens (`email: null`)
-  pass on slug match alone and can't be listed/removed/renamed. `issueMagicLink`
+  it never lives in the public `config.json`. `issueMagicLink`
   only mints a login link; granting is explicit (`createSite` seed,
   `POST /sites/:slug/editors`).
 - **Cloudflare provisioning** — `cfFetch`, `ensurePagesProject`, `ensureDnsRecord`,
@@ -101,9 +100,8 @@ Key helper groups (each has a `// ---` banner comment):
 3. **Slug** — `SLUG_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/`; reserved: `api, editor, www, data`.
    A token is valid for a slug only if `tokens[sha256(token)].slug` equals that
    **exact** slug, **and** (for email-bound tokens) its bound email is in the slug's
-   `emails` grant. Grandfathered tokens (`email: null`, migrated from the legacy
-   format) pass on slug match alone — and cannot be revoked/renamed by the editor
-   endpoints.
+   `emails` grant. (A defensive token with `email: null`, should one exist, passes
+   on slug match alone — there is no migrated legacy format anymore.)
 4. **Timing-safe comparison** — `timingSafeEqual` is still used for the admin token
    hash (`authorizeAdmin`). Editor token lookups use a **direct** `tokens[sha256(token)]`
    object probe rather than the old all-entries sweep: token hashes are 256-bit random,
@@ -121,10 +119,11 @@ Key helper groups (each has a `// ---` banner comment):
   per-file races into one file but is no worse per-operation; acceptable given the
   occasional-administration workload, not mass concurrent minting.
 - **`AUTH_KEY` is the single point of failure.** `auth.enc` is the only copy of every
-  token and grant (the bucket is public and migration deletes the legacy files).
-  On decrypt failure `readAuthState` returns null → handlers 503, and migration is
-  never re-run over an existing `auth.enc`. Back `AUTH_KEY` up; the migration is
-  effectively one-way.
+  token and grant (the bucket is public). It must be base64 of exactly 32 bytes; a
+  missing or invalid key means encrypts fail (every write returns `503`, `auth
+  encryption key not configured`) and decrypts fail (`readAuthState` → null → handlers
+  503). There is no migration — `auth.enc` is created lazily on the first write and
+  reads of a missing `auth.enc` return an empty state. Back `AUTH_KEY` up.
 - **`readFile` is defined but unrouted**: there's no `GET /sites/:slug/:token`
   handler in `fetch`; reads are public from the data host. Don't add a public read
   route without reconsidering the auth model — `readFile` already requires an
