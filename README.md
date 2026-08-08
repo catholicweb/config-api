@@ -53,6 +53,7 @@ the code ever disagree, **the code wins** and this README must be corrected.
 | POST   | `/auth/request`          | —               | body `{ "email": "<addr>" }` — email a one-time magic **login** link to every slug the address can edit (resolved server-side from the email grant); never grants access; returns a generic success either way | `200 { ok, email }` / `400/503` |
 | POST   | `/sites/backfill-cache`  | `Bearer admin`  | — maintenance: re-stamp `Cache-Control` metadata onto every existing bucket object so `data.parroquia.app` caches them (idempotent) | `200 { ok, updated, skipped }` / `401/403/503` |
 | PUT    | `/sites/:slug/:token`    | `Bearer editor` | body = raw bytes, `Content-Type` optional. Writing `config.json` also triggers an automatic page build (best-effort, see [Auto-build](#auto-build)) | `200 { ok, slug, key }` / `400/401/403` |
+| PATCH  | `/sites/:slug/config.json` | `Bearer editor` | body `{ "ops": [...] }` — apply a small **diff** onto the currently stored `config.json` and return the merged doc (used by the editor for small, per-field, last-edit-wins concurrent saves; see [Patch saves](#patch-saves)). Also triggers an automatic page build | `200 { ok, slug, key, data, skipped }` / `400/401/403/404/500` |
 | DELETE | `/sites/:slug/:token`    | `Bearer editor` | —                                                  | `200 { ok, slug, key }` / `400/401/403` |
 
 **Reserved slugs** (rejected on site creation): `api`, `editor`, `www`, `data`.
@@ -284,8 +285,11 @@ the old public `auth.json`/`magic.json`/`emails.json` are never read or deleted
 | File                 | Depends on                          |
 |----------------------|--------------------------------------|
 | `config-api/src/index.js` | validation (`FILENAME_RE`, `ALLOWED_EXT`), endpoint definitions (_`SLUG_RE` is **not** cross-repo-synced — it is intentionally stricter than `migrate.js` and subdomain-safe_) |
+| `config-api/src/patch.js` | **mirrored byte-for-byte** with `editor/.../theme/lib/patch.js` (diff/apply convention; see [Patch saves](#patch-saves)) |
 | `editor/.../theme/lib/codec.js` | token encode/validate |
 | `editor/.../theme/lib/api.js` | endpoint definitions, auth headers |
+| `editor/.../theme/lib/patch.js` | **mirrored byte-for-byte** with `config-api/src/patch.js` (diff/apply convention); the editor's `diff` half |
+| `editor/.../theme/lib/schema.js` | `UUID_KEY` / `injectUuid` — must equal `UUID_KEY` in the patch mirrors |
 | `web-template/.../migrate.js` | token encode/validate, endpoint definitions, R2 layout |
 
 Before changing **any** of: token rules, an endpoint, or the R2 layout, update
@@ -306,6 +310,49 @@ are follow-ups in the **editor** repo.
 **Deploy prerequisite:** before creating any site, put a default `config.json` at
 the **bucket root** — `createSite` copies it into every new site and returns `503`
 if it is missing.
+
+## Patch saves
+
+`config.json` is edited concurrently by several people. Instead of the editor
+overwriting the whole file (which clobbers unrelated concurrent edits and can
+exceed the keepalive body cap on the on-leave flush), the editor sends a small
+**diff** that this API applies onto its *current* stored document.
+
+The diff/apply convention lives in `src/patch.js`, **mirrored byte-for-byte** with
+`editor/.../theme/lib/patch.js` (same pattern as `codec.js`). It is 100%
+**data-guided** — no schema is needed on the server:
+
+- An array whose every item is a plain object with a non-empty string `uuid` is
+  a **keyed** list → diffed/addressed by that stable uuid. The editor's schema
+  injects a hidden `uuid` default into every object-list/block-list (see
+  `schema.js`), so per-field edits within an item are last-edit-wins even against
+  a concurrently-updated base, and a concurrently-removed item is never
+  resurrected (a `{ uuid }` that no longer resolves is a harmless no-op).
+- **Any other array** (scalars, or objects lacking `uuid`) is **keyless** → on
+  change it is replaced wholesale by one absolute `set`.
+
+Op vocabulary (a `path` is an array of string keys and/or `{ uuid }` segments):
+
+| Op | Shape | Meaning |
+|----|-------|---------|
+| `set` | `{ op, path, value }` | absolute-assign at `path` |
+| `remove` | `{ op, path }` | delete an object key, or (last segment `{ uuid }`) remove that keyed list item; no-op if absent |
+| `listAdd` | `{ op, path, uuid, index, value }` | insert a new keyed item |
+| `listReorder` | `{ op, path, uuids }` | set the list's uuid order (appends any current items not named, so concurrent adds are never dropped) |
+
+The endpoint returns `{ ok, slug, key, data, skipped }`, where `data` is the
+**merged** document — the editor adopts it back to preserve multi-editor
+freshness and to pick up server-side additions.
+
+**First save after the editor loads is still a full `PUT`** (hydration): the
+`PUT` persists the schema-backfilled uuids server-side so subsequent `{ uuid }`
+patch ops can resolve. Only later saves are patches.
+
+**Known trade-off:** two concurrent PATCHes that read the same base can, at the
+R2 read-modify-write boundary, lose a different-field change (there is no CAS /
+etag on document content — the same limitation as today's concurrent PUTs).
+Per-field last-edit-wins mitigates same-field races; acceptable for occasional
+co-editing.
 
 ## Public read host
 

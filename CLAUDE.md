@@ -47,6 +47,9 @@ Deploy gotchas:
 
 `src/index.js` is one module exporting a `fetch` handler. Routing is manual
 segment parsing (no framework) with percent-decoding and validation built in.
+`src/patch.js` holds the mirrored diff/apply convention — it **must stay
+byte-for-byte identical** to `editor/.../theme/lib/patch.js` (see README
+"Patch saves"); change both or neither.
 
 Request flow, in order:
 1. Parse and **percent-decode each path segment before validation** (catches
@@ -63,6 +66,8 @@ Request flow, in order:
      gated by admin OR an editor token for the slug
      (`listEditors`/`addEditor`/`updateEditor`/`removeEditor`)
    - `PUT`/`DELETE /sites/:slug/:token` — editor-gated writes (`putFile`/`deleteFile`)
+   - `PATCH /sites/:slug/config.json` — editor-gated small diff apply onto the
+     stored `config.json` (`patchConfigFile`); scoped to `config.json` only
 
 Key helper groups (each has a `// ---` banner comment):
 - **Validation** — `validateFilename`, `validateSlug`, `validateToken`,
