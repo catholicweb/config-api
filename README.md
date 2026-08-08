@@ -25,6 +25,20 @@ R2 bucket (`parroquia`, bound as `env.CONTENT`).
   `GET /sites/:slug/:token` route on the Worker — content is public, so reads
   never need the Worker.
 
+### Media values are absolute URLs
+
+The Worker returns **absolute public URLs** — not bare tokens, not `/media/...`
+paths — for media. `GET /sites/:slug(/list)` returns `files: [...url...]` and
+`PUT/DELETE /sites/:slug/:token` return a `url` field, each of the form
+`https://data.parroquia.app/<slug>/<token>`. Consumers (the editor) treat them as
+opaque absolute URLs and never decode them back to tokens; `<img src>` and
+`og:image` use them directly, and the stored config field value is the absolute URL.
+
+The origin is configurable via the `DATA_BASE` `[vars]` entry (default
+`https://data.parroquia.app`), mirroring `MAGIC_LINK_BASE`. Storing/uploads still
+use the flat validated filename as the R2 key (see [Token encoding](#token-encoding));
+only the **returned** representation is an absolute URL.
+
 ## Single source of truth
 
 This README canonicalizes the **contract** (endpoints, token rules, R2 layout).
@@ -52,8 +66,8 @@ the code ever disagree, **the code wins** and this README must be corrected.
 | POST   | `/auth/magic`            | —               | body `{ "code": "<64hex>" }` (one-time, from the email) | `200 { ok, slug, token }` / `400/404/410` |
 | POST   | `/auth/request`          | —               | body `{ "email": "<addr>" }` — email a one-time magic **login** link to every slug the address can edit (resolved server-side from the email grant); never grants access; returns a generic success either way | `200 { ok, email }` / `400/503` |
 | POST   | `/sites/backfill-cache`  | `Bearer admin`  | — maintenance: re-stamp `Cache-Control` metadata onto every existing bucket object so `data.parroquia.app` caches them (idempotent) | `200 { ok, updated, skipped }` / `401/403/503` |
-| PUT    | `/sites/:slug/:token`    | `Bearer editor` | body = raw bytes, `Content-Type` optional. Writing `config.json` also triggers an automatic page build (best-effort, see [Auto-build](#auto-build)) | `200 { ok, slug, key }` / `400/401/403` |
-| DELETE | `/sites/:slug/:token`    | `Bearer editor` | —                                                  | `200 { ok, slug, key }` / `400/401/403` |
+| PUT    | `/sites/:slug/:token`    | `Bearer editor` | body = raw bytes, `Content-Type` optional. Writing `config.json` also triggers an automatic page build (best-effort, see [Auto-build](#auto-build)) | `200 { ok, slug, key, url }` / `400/401/403` |
+| DELETE | `/sites/:slug/:token`    | `Bearer editor` | —                                                  | `200 { ok, slug, key, url }` / `400/401/403` |
 
 **Reserved slugs** (rejected on site creation): `api`, `editor`, `www`, `data`.
 
@@ -288,8 +302,9 @@ the old public `auth.json`/`magic.json`/`emails.json` are never read or deleted
 | `editor/.../theme/lib/api.js` | endpoint definitions, auth headers |
 | `web-template/.../migrate.js` | token encode/validate, endpoint definitions, R2 layout |
 
-Before changing **any** of: token rules, an endpoint, or the R2 layout, update
-this README **and** every file above.
+Before changing **any** of: token rules, an endpoint, the R2 layout, **or the
+media URL representation** (now absolute URLs built from `DATA_BASE`), update this
+README **and** every file above.
 
 The magic-link + editor-permissions changes add `POST /auth/magic`,
 `POST /sites/:slug/magic` (open login link) and the editor-management endpoints

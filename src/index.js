@@ -388,6 +388,20 @@ function validateSlugNotReserved(slug) {
   return !RESERVED_SLUGS.has(slug.toLowerCase());
 }
 
+// Public origin that serves file bytes (no auth) at /:slug/:token — the home of
+// every media URL we hand out. Configurable via the DATA_BASE [vars] entry
+// (default https://data.parroquia.app); the worker is never queried on this host,
+// so it cannot be derived from request.url.
+function dataBase(env) {
+  return (env.DATA_BASE || "https://data.parroquia.app").replace(/\/$/, "");
+}
+
+// Absolute public URL for one file: https://data.parroquia.app/<slug>/<token>.
+// This is the single representation returned for media/list results.
+function fileUrl(env, slug, token) {
+  return `${dataBase(env)}/${slug}/${encodeURIComponent(token)}`;
+}
+
 // A minimal, intentionally permissive email shape check. The address is only
 // used to deliver a magic link; exact spec-compliance is the mail provider's job.
 function validateEmail(email) {
@@ -1378,8 +1392,9 @@ async function listSlugs(env) {
   return Response.json({ slugs });
 }
 
-// Returns the list of file TOKENS under a slug (the key suffixes). migrate.js
-// decodes each token back to a local path. The internal .site marker is skipped.
+// Returns the list of file URLs under a slug: one absolute public URL per file
+// (https://data.parroquia.app/<slug>/<token>). The internal .site marker is
+// skipped. Consumers treat these as opaque absolute URLs — no token decoding.
 async function listFiles(env, slug) {
   const prefix = `${slug}/`;
   const files = [];
@@ -1389,7 +1404,7 @@ async function listFiles(env, slug) {
     for (const o of listed.objects) {
       const token = o.key.slice(prefix.length); // strip "<slug>/"
       if (token === SITE_MARKER) continue; // internal marker
-      files.push(token);
+      files.push(fileUrl(env, slug, token));
     }
     cursor = listed.truncated ? listed.cursor : undefined;
   } while (cursor);
@@ -1435,7 +1450,9 @@ async function putFile(ctx, env, slug, token, request) {
   if (token === 'config.json' && ctx?.waitUntil) {
     ctx.waitUntil(githubDispatch(env, slug));
   }
-  return Response.json({ ok: true, slug, key }, { status: 200 });
+  // `url` is the absolute public URL of the stored file, so a client that just
+  // uploaded media can use it directly as the field value.
+  return Response.json({ ok: true, slug, key, url: fileUrl(env, slug, token) }, { status: 200 });
 }
 
 // Admin-gated maintenance: rewrite every object's httpMetadata.cacheControl so the
@@ -1482,5 +1499,5 @@ async function deleteFile(env, slug, token) {
     return new Response('Invalid path', { status: 400 });
   }
   await env.CONTENT.delete(key);
-  return Response.json({ ok: true, slug, key }, { status: 200 });
+  return Response.json({ ok: true, slug, key, url: fileUrl(env, slug, token) }, { status: 200 });
 }

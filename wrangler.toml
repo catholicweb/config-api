@@ -55,6 +55,11 @@ workers_dev = false
 [vars]
 MAGIC_LINK_BASE = "https://editor.parroquia.app/magic"
 
+# Public origin that serves file bytes at /:slug/:token (no auth). The worker
+# builds every media/list absolute URL from this. Defaults to
+# https://data.parroquia.app when unset, mirroring MAGIC_LINK_BASE.
+DATA_BASE = "https://data.parroquia.app"
+
 [[r2_buckets]]
 binding = "CONTENT"
 bucket_name = "parroquia"
