@@ -88,9 +88,11 @@
  * Two distinct capabilities:
  *   - ADMIN_TOKEN_HASH (Worker secret, never in the bucket): authenticates as admin.
  *     Set with `wrangler secret put ADMIN_TOKEN_HASH` (prod) or `.dev.vars` (local).
- *   - per-slug editor tokens (256-bit random, stored as SHA-256 in the encrypted
- *     state): gate writes for that slug only. Tokens are minted via the magic-link
- *     exchange (POST /auth/magic), not returned directly at site creation.
+ *   - editor tokens (256-bit random, stored as SHA-256 in the encrypted state):
+ *     authorize writes to ANY slug the bound email is granted on (multisession,
+ *     one token per email across all its slugs). Tokens are minted via the
+ *     magic-link exchange (POST /auth/magic), not returned directly at site
+ *     creation.
  *
  * Site creation (POST /sites/:slug) accepts EITHER capability: the admin secret, or
  * an editor token valid for any slug the caller can edit (authorizeAdminOrEditorAny).
@@ -114,8 +116,9 @@
  *
  * Editor auth: the incoming bearer token is SHA-256 hashed and looked up directly
  * in the decrypted `state.tokens`. The request is authorized only if the entry
- * exists AND its mapped slug equals the slug in the URL path AND (for email-bound
- * tokens) the email is in the slug's grant list. Tokens are 256-bit random values,
+ * exists AND the email bound to the token is in the URL slug's grant list
+ * (multisession — one token covers every slug that email can edit; the token's own
+ * `slug` field is deliberately not consulted). Tokens are 256-bit random values,
  * so their SHA-256 hashes are not brute-forceable.
  *
  * CRITICAL INVARIANT: the server must never interpret a filename as a path. It is
@@ -635,9 +638,10 @@ async function writeJsonMap(env, key, map) {
 /**
  * Authorize an editor request for `slug`. The bearer token is SHA-256 hashed and
  * looked up directly in the single encrypted state (`state.tokens[sha256(token)]`).
- * The token is valid only if its mapped slug equals the URL slug. For email-bound
- * tokens, the bound email must also be listed in the slug's grant. (A token with
- * `email: null`, retained as a defensive leftover, passes on slug match alone.)
+ * The token is valid for a `slug` when the email it is bound to is granted on that
+ * slug (`emails[email].includes(slug)`) — one token covers every slug the email can
+ * edit (multisession). (A token with `email: null`, retained as a defensive
+ * leftover, is pinned to the single slug it was minted for.)
  *
  * Direct object lookup replaces the old all-entries `timingSafeEqual` sweep: token
  * hashes are 256-bit random values, so a timing side channel on a single key probe
@@ -652,11 +656,20 @@ async function authorize(env, slug, request) {
   if (!state) return { ok: false, status: 503, error: 'auth state unavailable' };
 
   const entry = state.tokens[tokenHash];
-  if (!entry || entry.slug !== slug) {
-    return { ok: false, status: 403, error: 'token not valid for this slug' };
+  if (!entry) {
+    return { ok: false, status: 403, error: 'token not valid' };
   }
-  if (entry.email == null) return { ok: true }; // email-less (defensive) token: no grant check
+  if (entry.email == null) {
+    // Email-less (defensive) token: keep old single-slug semantics — only valid
+    // for the exact slug it was minted for, never for other slugs.
+    return entry.slug === slug
+      ? { ok: true }
+      : { ok: false, status: 403, error: 'token not valid for this slug' };
+  }
 
+  // Multisession: an email-bound token authorizes every slug the email is granted
+  // on. state.emails is the single source of truth, so revoking the grant
+  // immediately blocks the token there. entry.slug is deliberately not consulted.
   const slugs = state.emails[entry.email] || [];
   if (!slugs.includes(slug)) {
     return { ok: false, status: 403, error: 'email not authorized for this slug' };
@@ -723,7 +736,14 @@ async function whoami(env, request) {
 
   const entry = state.tokens[tokenHash];
   if (!entry) return Response.json({ error: 'invalid token' }, { status: 403 });
-  return Response.json({ slug: entry.slug });
+
+  // Multisession identity: the editor needs the full roster of slugs its email can
+  // edit to render the site switcher. `slug` stays for backward compatibility.
+  if (entry.email == null) {
+    return Response.json({ slug: entry.slug, email: null, slugs: [entry.slug] });
+  }
+  const slugs = (state.emails[entry.email] || []).filter(Boolean);
+  return Response.json({ slug: entry.slug, email: entry.email, slugs });
 }
 
 // ---------------------------------------------------------------------------
@@ -774,6 +794,7 @@ async function githubDispatch(env, slug) {
         Accept: 'application/vnd.github+json',
         'Content-Type': 'application/json',
         'X-GitHub-Api-Version': '2022-11-28',
+        'User-Agent': 'parroquia-config-api',
       },
       body: JSON.stringify({ ref: BUILD_REF, inputs: { site_slug: slug } }),
     },
@@ -1324,7 +1345,9 @@ async function sendMagicLinkEmail(env, email, slug, code) {
  * mints a 256-bit editor token (sha256 stored in state.tokens → { slug, email }),
  * removes the code (one-time invalidation), and returns the token once. The
  * minted token inherits the code's bound email (always set for codes issued by
- * issueMagicLink).
+ * issueMagicLink). Alongside the token it returns the email and that email's full
+ * slug grant (the multisession roster) so the editor can offer a site switcher
+ * immediately, before any /whoami round-trip.
  */
 async function exchangeMagic(env, request) {
   const body = await readJsonBody(request);
@@ -1351,18 +1374,24 @@ async function exchangeMagic(env, request) {
   }
 
   const slug = record.slug;
+  const email = record.email == null ? null : record.email;
 
   // Consume the code first so it cannot be reused, then mint the editor token.
   delete state.magic[codeHash];
 
   const token = generateToken();
   const tokenHash = await sha256Hex(token);
-  state.tokens[tokenHash] = { slug, email: record.email == null ? null : record.email };
+  state.tokens[tokenHash] = { slug, email };
 
   const res = await writeAuthState(env, state);
   if (!res.ok) return Response.json({ error: res.error }, { status: 503 });
 
-  return Response.json({ ok: true, slug, token }, { status: 200 });
+  // Grant list at redemption time, so the client can render the site switcher
+  // before ever calling /whoami. If the email was revoked from `slug` between
+  // send and redemption, `slugs` may already omit it — the client re-targets.
+  const slugs = email == null ? [slug] : (state.emails[email] || []).filter(Boolean);
+
+  return Response.json({ ok: true, slug, token, email, slugs }, { status: 200 });
 }
 
 // ---------------------------------------------------------------------------

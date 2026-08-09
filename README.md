@@ -52,7 +52,7 @@ the code ever disagree, **the code wins** and this README must be corrected.
 | Method | Path                     | Auth            | Request                                            | Response |
 |--------|--------------------------|-----------------|----------------------------------------------------|----------|
 | GET    | `/health`                | —               | —                                                  | `200 { ok, bindings }` / `503` |
-| GET    | `/whoami`                | `Bearer editor` | —                                                  | `200 { slug }` / `401` / `403` |
+| GET    | `/whoami`                | `Bearer editor` | —                                                  | `200 { slug, email, slugs }` / `401` / `403` |
 | GET    | `/sites`                 | —               | —                                                  | `200 { slugs: [...] }` |
 | GET    | `/sites/:slug`           | —               | `:slug` validated (see slug rules)                 | `200 { slug, files: [...] }` / `400` |
 | GET    | `/sites/list`            | —               | —                                                  | `200 { slugs: [...] }` *(legacy alias of `/sites`)* |
@@ -63,7 +63,7 @@ the code ever disagree, **the code wins** and this README must be corrected.
 | GET    | `/sites/:slug/editors`   | `Bearer editor | admin` | `:slug` must exist — list the emails granted write access to **this** slug only | `200 { ok, slug, editors: [...] }` / `400/401/403/404/503` |
 | PATCH  | `/sites/:slug/editors`   | `Bearer editor | admin` | `:slug` must exist; body `{ "from": "<old>", "to": "<new>" }` — change an editor's email: re-grants `to` and re-binds `from`'s tokens so existing sessions keep working | `200 { ok, slug, from, to }` / `400/401/403/404/503` |
 | DELETE | `/sites/:slug/editors`   | `Bearer editor | admin` | `:slug` must exist; body `{ "email": "<addr>" }` — remove the editor and revoke their tokens for this slug | `200 { ok, slug, email }` / `400/401/403/404/503` |
-| POST   | `/auth/magic`            | —               | body `{ "code": "<64hex>" }` (one-time, from the email) | `200 { ok, slug, token }` / `400/404/410` |
+| POST   | `/auth/magic`            | —               | body `{ "code": "<64hex>" }` (one-time, from the email) | `200 { ok, slug, token, email, slugs }` / `400/404/410` |
 | POST   | `/auth/request`          | —               | body `{ "email": "<addr>" }` — email a one-time magic **login** link to every slug the address can edit (resolved server-side from the email grant); never grants access; returns a generic success either way | `200 { ok, email }` / `400/503` |
 | POST   | `/sites/backfill-cache`  | `Bearer admin`  | — maintenance: re-stamp `Cache-Control` metadata onto every existing bucket object so `data.parroquia.app` caches them (idempotent) | `200 { ok, updated, skipped }` / `401/403/503` |
 | PUT    | `/sites/:slug/:token`    | `Bearer editor` | body = raw bytes, `Content-Type` optional. Writing `config.json` also triggers an automatic page build (best-effort, see [Auto-build](#auto-build)) | `200 { ok, slug, key, url }` / `400/401/403` |
@@ -169,9 +169,13 @@ Two capabilities:
   state lives in ONE encrypted blob `auth.enc` (AES-GCM-256, keyed by `AUTH_KEY`),
   holding `{ emails, tokens, magic }`. Inside the decrypted state the bearer token
   is SHA-256-hashed and looked up as `tokens[sha256(token)] → { slug, email }`. A
-  request is authorized only if that entry exists **and** its mapped slug equals
-  the slug in the URL path **and** the bound email is in that slug's `emails[...]`
-  grant. Gates writes (`PUT`/`DELETE`) and, with the admin secret, the
+  request is authorized only if that entry exists **and** the bound email is in
+  the URL slug's `emails[...]` grant — **one token covers every slug the email can
+  edit** (multisession; the token's own `slug` field is not consulted). The editor
+  learns the full slug roster from `GET /whoami` or the `POST /auth/magic`
+  response and switches sites client-side without a new token. Revocation flows
+  through the grant: removing an email from a slug's grant list immediately blocks
+  the token there. Gates writes (`PUT`/`DELETE`) and, with the admin secret, the
   editor-management endpoints for that slug. An editor token valid for **any** slug
   also authorizes `POST /sites/:slug` (site creation), so a logged-in editor can
   create new sites; the new site's owner is the body `{ "email" }`, same as the
@@ -199,7 +203,9 @@ and kicks off magic-link login instead:
    `POST /auth/magic`. Possession of the code proves ownership of the inbox.
 5. The worker mints a fresh 256-bit editor token, stores
    `sha256(token) → { slug, email }` in the decrypted state, **deletes the code**
-   (single-use), and returns `{ ok, slug, token }`.
+   (single-use), and returns `{ ok, slug, token, email, slugs }` — the last two
+   fields identify the bound email and every slug it can edit (the multisession
+   roster), so the editor can offer a site switcher immediately.
 
 **Managing co-editors** (gated by **either** the admin secret **or** an editor
 token valid for the requesting editor's own slug; write permission grants the
