@@ -52,11 +52,13 @@ the code ever disagree, **the code wins** and this README must be corrected.
 | POST   | `/auth/magic`            | —               | body `{ "code": "<64hex>" }` (one-time, from the email) | `200 { ok, slug, token }` / `400/404/410` |
 | POST   | `/auth/request`          | —               | body `{ "email": "<addr>" }` — email a one-time magic **login** link to every slug the address can edit (resolved server-side from the email grant); never grants access; returns a generic success either way | `200 { ok, email }` / `400/503` |
 | POST   | `/sites/backfill-cache`  | `Bearer admin`  | — maintenance: re-stamp `Cache-Control` metadata onto every existing bucket object so `data.parroquia.app` caches them (idempotent) | `200 { ok, updated, skipped }` / `401/403/503` |
+| POST   | `/sites/:slug/clone`    | `Bearer admin`  | body `{ "targetSlug": "<slug>" }` — clone all content (files, email grants, config.json media URL rewriting) from an existing slug to a new slug; provisions Cloudflare for the target; does not modify the source | `201 { ok, sourceSlug, targetSlug, filesCopied, domainStatus }` / `400/401/403/404/409/502/503` |
+| DELETE | `/sites/:slug`          | `Bearer admin`  | — delete a site entirely: best-effort Cloudflare resource cleanup, then remove all R2 content, clean up auth.enc grants/tokens/magic, re-scan slugs.json | `200 { ok, slug, filesDeleted, cfWarnings? }` / `400/401/403/404/503` |
 | PUT    | `/sites/:slug/:token`    | `Bearer editor` | body = raw bytes, `Content-Type` optional. Writing `config.json` also triggers an automatic page build (best-effort, see [Auto-build](#auto-build)) | `200 { ok, slug, key }` / `400/401/403` |
 | PATCH  | `/sites/:slug/config.json` | `Bearer editor` | body `{ "ops": [...] }` — apply a small **diff** onto the currently stored `config.json` and return the merged doc (used by the editor for small, per-field, last-edit-wins concurrent saves; see [Patch saves](#patch-saves)). Also triggers an automatic page build | `200 { ok, slug, key, data, skipped }` / `400/401/403/404/500` |
 | DELETE | `/sites/:slug/:token`    | `Bearer editor` | —                                                  | `200 { ok, slug, key }` / `400/401/403` |
 
-**Reserved slugs** (rejected on site creation): `api`, `editor`, `www`, `data`.
+**Reserved slugs** (rejected on site creation and cloning): `api`, `editor`, `www`, `data`.
 
 Slug rules: single path segment, lowercase `[a-z0-9]` with optional internal
 hyphens, 1–63 chars, no leading/trailing hyphen, no dots/slashes/underscores
@@ -136,9 +138,46 @@ curl -X PUT \
 curl -X DELETE -H "Authorization: Bearer <EDITOR_TOKEN>" \
   https://api.parroquia.app/sites/<slug>/noticias.md
 
+# Clone a site (admin only) — copy all content from an existing slug to a new one
+curl -X POST \
+  -H "Authorization: Bearer <ADMIN_TOKEN>" \
+  -H "Content-Type: application/json" \
+  --data '{"targetSlug":"new-slug-name"}' \
+  https://api.parroquia.app/sites/<slug>/clone
+
+# Delete a site entirely (admin only) — removes content, Cloudflare resources,
+# and auth entries
+curl -X DELETE -H "Authorization: Bearer <ADMIN_TOKEN>" \
+  https://api.parroquia.app/sites/<slug>
+
 # Read a file (public, no auth) — from the data host, not the Worker
 curl https://data.parroquia.app/<slug>/noticias.md
 ```
+
+### Slug renaming
+
+There is no single "rename" endpoint. Renaming a slug is a two-step process
+using the clone and delete endpoints:
+
+1. `POST /sites/:slug/clone` with `{ "targetSlug": "<new-name>" }` — copies all
+   files, email grants, and provisions Cloudflare for the new slug. A build is
+   dispatched for the new slug (fire-and-forget).
+2. `DELETE /sites/:slug` — removes the old slug's content, Cloudflare resources,
+   and auth entries.
+
+Clone does NOT modify the source slug, so the delete step is always optional
+— you can keep the old slug as a permanent alias.
+
+**Limitations:**
+- Legacy email-less editor tokens (very old tokens with `email: null`) are NOT
+  granted access to the cloned slug. Only email-bound tokens (the current token
+  model) are automatically carried over via the email grant copy.
+- Config.json media URLs are rewritten from
+  `https://data.parroquia.app/<old-slug>/` to
+  `https://data.parroquia.app/<new-slug>/` during cloning. Other files are
+  copied verbatim.
+- Cloudflare Pages builds are dispatched for the new slug only (fire-and-forget).
+  The old slug's build is not affected.
 
 ## Auth model
 

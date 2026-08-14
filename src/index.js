@@ -227,6 +227,18 @@ export default {
       return reprovisionSite(ctx, env, slug);
     }
 
+    // POST /sites/:slug/clone — admin-gated: clone all content from source
+    // slug to a target slug (new slug). Copies R2 objects (rewriting config.json
+    // media URLs), copies email grants in auth.enc, provisions Cloudflare for
+    // targetSlug, dispatches a build. Does NOT modify the source slug.
+    if (method === 'POST' && segments.length === 3 && segments[2] === 'clone') {
+      const slug = segments[1];
+      if (!validateSlug(slug)) return new Response('Invalid slug', { status: 400 });
+      const admin = await authorizeAdmin(env, request);
+      if (!admin.ok) return Response.json({ error: admin.error }, { status: admin.status });
+      return cloneSite(ctx, env, slug, request);
+    }
+
     // GET /sites — list all slugs
     if (method === 'GET' && segments.length === 1) {
       return listSlugs(env);
@@ -322,6 +334,17 @@ export default {
       if (!auth.ok) return Response.json({ error: auth.error }, { status: auth.status });
 
       return updateEditor(env, request, slug);
+    }
+
+    // DELETE /sites/:slug — admin-gated: delete a site entirely. Best-effort
+    // Cloudflare resource cleanup, then delete all R2 content under the slug,
+    // clean up auth.enc grants/tokens/magic, and re-scan slugs.json.
+    if (method === 'DELETE' && segments.length === 2) {
+      const slug = segments[1];
+      if (!validateSlug(slug)) return new Response('Invalid slug', { status: 400 });
+      const admin = await authorizeAdmin(env, request);
+      if (!admin.ok) return Response.json({ error: admin.error }, { status: admin.status });
+      return deleteSite(ctx, env, slug);
     }
 
     // PATCH /sites/:slug/config.json — apply a small diff to config.json
@@ -995,6 +1018,70 @@ async function reattachCustomDomain(env, slug) {
   return getCustomDomainStatus(env, slug);
 }
 
+/**
+ * Delete a Cloudflare Pages project for `slug`. Best-effort: failures are logged
+ * and returned but not thrown, so the caller can continue cleanup.
+ * Returns { ok, error? }.
+ */
+async function deletePagesProject(env, slug) {
+  const accountId = env.CLOUDFLARE_ACCOUNT_ID;
+  if (!accountId) return { ok: false, error: 'CLOUDFLARE_ACCOUNT_ID not configured' };
+  try {
+    const res = await cfFetch(env, `/accounts/${accountId}/pages/projects/${slug}`, {
+      method: 'DELETE',
+    });
+    if (res.success) return { ok: true };
+    // 8000 = project not found — not an error worth propagating
+    if (res.errors?.[0]?.code === 8000) return { ok: true };
+    return { ok: false, error: res.errors?.[0]?.message ?? 'failed to delete Pages project' };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
+/**
+ * Delete all DNS records for `{slug}.parroquia.app`. Best-effort: failures are
+ * returned but not thrown, so the caller can continue cleanup.
+ * Returns { ok, error? }.
+ */
+async function deleteDnsRecord(env, slug) {
+  const zoneId = env.CLOUDFLARE_ZONE_ID;
+  if (!zoneId) return { ok: false, error: 'CLOUDFLARE_ZONE_ID not configured' };
+  const name = `${slug}.parroquia.app`;
+  try {
+    const listed = await cfFetch(env, `/zones/${zoneId}/dns_records?name=${encodeURIComponent(name)}`);
+    if (!listed.success) {
+      return { ok: false, error: listed.errors?.[0]?.message ?? 'failed to list DNS records' };
+    }
+    const records = listed.result || [];
+    for (const r of records) {
+      await cfFetch(env, `/zones/${zoneId}/dns_records/${r.id}`, { method: 'DELETE' });
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
+/**
+ * Detach the custom domain `{slug}.parroquia.app` from the Pages project `slug`.
+ * Best-effort: failures are returned but not thrown.
+ * Returns { ok, error? }.
+ */
+async function deleteCustomDomain(env, slug) {
+  const accountId = env.CLOUDFLARE_ACCOUNT_ID;
+  if (!accountId) return { ok: false, error: 'CLOUDFLARE_ACCOUNT_ID not configured' };
+  const name = `${slug}.parroquia.app`;
+  try {
+    await cfFetch(env, `/accounts/${accountId}/pages/projects/${slug}/domains/${encodeURIComponent(name)}`, {
+      method: 'DELETE',
+    });
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Site existence / creation
 // ---------------------------------------------------------------------------
@@ -1298,6 +1385,226 @@ async function reprovisionSite(ctx, env, slug) {
       { status: 502 },
     );
   }
+}
+
+/**
+ * POST /sites/:slug/clone — admin-gated: clone all content from sourceSlug to
+ * targetSlug. Copies R2 objects (rewriting config.json media URLs), copies
+ * email grants in auth.enc, provisions Cloudflare for targetSlug, dispatches
+ * a build. Does NOT modify the source slug at all.
+ */
+async function cloneSite(ctx, env, sourceSlug, request) {
+  // 1. Validate source slug exists
+  if (!(await siteExists(env, sourceSlug))) {
+    return Response.json({ error: 'source slug not found' }, { status: 404 });
+  }
+
+  // 2. Extract and validate target slug from JSON body
+  const body = await readJsonBody(request);
+  if (!body.ok) return Response.json({ error: body.error }, { status: 400 });
+  const targetSlug = body.data.targetSlug;
+  if (!targetSlug || typeof targetSlug !== 'string') {
+    return Response.json({ error: 'targetSlug is required as a string' }, { status: 400 });
+  }
+  if (!validateSlug(targetSlug)) {
+    return Response.json({ error: 'invalid target slug' }, { status: 400 });
+  }
+  if (!validateSlugNotReserved(targetSlug)) {
+    return Response.json({ error: 'target slug is reserved' }, { status: 400 });
+  }
+
+  // 3. Check target slug doesn't already exist
+  if (await siteExists(env, targetSlug)) {
+    return Response.json({ error: 'target slug already exists' }, { status: 409 });
+  }
+
+  // 4. Copy all R2 objects from sourceSlug/ prefix to targetSlug/ prefix.
+  //    For config.json, rewrite media URLs from dataBase(env)/{sourceSlug}/
+  //    to dataBase(env)/{targetSlug}/.
+  const prefix = `${sourceSlug}/`;
+  const db = dataBase(env);
+  let cursor;
+  let copied = 0;
+  do {
+    const listed = await env.CONTENT.list({ limit: 1000, cursor, prefix });
+    for (const obj of listed.objects) {
+      const filename = obj.key.slice(prefix.length);
+      const sourceKey = obj.key;
+
+      const sourceObj = await env.CONTENT.get(sourceKey);
+      if (!sourceObj) continue;
+
+      let bodyContent = await sourceObj.arrayBuffer();
+      let contentType = sourceObj.httpMetadata?.contentType || 'application/octet-stream';
+
+      if (filename === 'config.json') {
+        const search = `${db}/${sourceSlug}/`;
+        const replace = `${db}/${targetSlug}/`;
+        let text = new TextDecoder().decode(bodyContent);
+        if (text.includes(search)) {
+          text = text.split(search).join(replace);
+        }
+        bodyContent = new TextEncoder().encode(text).buffer;
+      }
+
+      const cacheControl = LIVING_FILES.has(filename) ? CACHE_REVALIDATE : CACHE_IMMUTABLE;
+      await env.CONTENT.put(`${targetSlug}/${filename}`, bodyContent, {
+        httpMetadata: { contentType, cacheControl },
+      });
+      copied += 1;
+    }
+    cursor = listed.truncated ? listed.cursor : undefined;
+  } while (cursor);
+
+  // 5. Copy email grants from sourceSlug to targetSlug. Email-bound tokens
+  //    automatically work for targetSlug via the multi-session grant check
+  //    (authorize() checks state.emails[email].includes(slug)).
+  const mres = await mutateState(env, (state) => {
+    for (const [email, slugs] of Object.entries(state.emails)) {
+      if (slugs.includes(sourceSlug) && !slugs.includes(targetSlug)) {
+        slugs.push(targetSlug);
+      }
+    }
+  });
+  if (!mres.ok) return Response.json({ error: mres.error }, { status: 503 });
+
+  // 6. Provision Cloudflare for targetSlug (same pattern as createSite)
+  let domainStatus;
+  try {
+    const proj = await ensurePagesProject(env, targetSlug);
+    if (!proj.ok) {
+      return Response.json(
+        { ok: false, error: `failed ensuring Cloudflare Pages project: ${proj.error}` },
+        { status: 502 },
+      );
+    }
+    const sub = await getPagesProjectSubdomain(env, targetSlug);
+    if (!sub.ok) {
+      return Response.json(
+        { ok: false, error: `failed reading Pages project subdomain: ${sub.error}` },
+        { status: 502 },
+      );
+    }
+    const dns = await ensureDnsRecord(env, targetSlug, sub.subdomain);
+    if (!dns.ok) {
+      return Response.json(
+        { ok: false, error: `failed ensuring DNS CNAME record: ${dns.error}` },
+        { status: 502 },
+      );
+    }
+    const domain = await ensureCustomDomain(env, targetSlug);
+    if (!domain.ok) {
+      return Response.json(
+        { ok: false, error: `failed attaching custom domain: ${domain.error}` },
+        { status: 502 },
+      );
+    }
+    const st = await getCustomDomainStatus(env, targetSlug);
+    if (st.ok) domainStatus = st.status;
+  } catch (err) {
+    return Response.json(
+      { ok: false, error: `failed during Cloudflare provisioning: ${err.message}` },
+      { status: 502 },
+    );
+  }
+
+  // 7. Write .site marker for targetSlug
+  await env.CONTENT.put(`${targetSlug}/${SITE_MARKER}`, '{"ok":true}', {
+    httpMetadata: { contentType: 'application/json', cacheControl: CACHE_REVALIDATE },
+  });
+
+  // 8. Dispatch build for targetSlug (fire-and-forget)
+  if (ctx?.waitUntil) {
+    ctx.waitUntil(githubDispatch(env, targetSlug));
+  }
+
+  // 9. Re-scan slugs.json from bucket
+  const slugs = await getSlugs(env);
+  await writeJsonMap(env, 'slugs.json', { slugs });
+
+  // 10. Return 201 with details
+  return Response.json({
+    ok: true,
+    sourceSlug,
+    targetSlug,
+    filesCopied: copied,
+    domainStatus,
+  }, { status: 201 });
+}
+
+/**
+ * DELETE /sites/:slug — admin-gated: delete a site entirely. Best-effort
+ * Cloudflare resource cleanup, then remove all R2 content under the slug,
+ * clean up auth.enc grants/tokens/magic, re-scan slugs.json.
+ */
+async function deleteSite(ctx, env, slug) {
+  // 1. Check slug exists
+  if (!(await siteExists(env, slug))) {
+    return Response.json({ error: 'slug not found' }, { status: 404 });
+  }
+
+  // 2. Best-effort Cloudflare resource cleanup (dependency order: domain →
+  //    DNS → project). Log failures but never fail the endpoint — R2 and
+  //    auth cleanup should proceed regardless.
+  const cfErrors = [];
+  try {
+    const domainResult = await deleteCustomDomain(env, slug);
+    if (!domainResult.ok) cfErrors.push(`custom domain: ${domainResult.error}`);
+  } catch (err) { cfErrors.push(`custom domain: ${err.message}`); }
+
+  try {
+    const dnsResult = await deleteDnsRecord(env, slug);
+    if (!dnsResult.ok) cfErrors.push(`DNS: ${dnsResult.error}`);
+  } catch (err) { cfErrors.push(`DNS: ${err.message}`); }
+
+  try {
+    const projResult = await deletePagesProject(env, slug);
+    if (!projResult.ok) cfErrors.push(`Pages project: ${projResult.error}`);
+  } catch (err) { cfErrors.push(`Pages project: ${err.message}`); }
+
+  for (const e of cfErrors) {
+    console.log(`deleteSite: ${slug} — ${e}`);
+  }
+
+  // 3. Delete all R2 objects under slug/ prefix
+  let deleted = 0;
+  let cursor;
+  do {
+    const listed = await env.CONTENT.list({ limit: 1000, cursor, prefix: `${slug}/` });
+    for (const obj of listed.objects) {
+      await env.CONTENT.delete(obj.key);
+      deleted += 1;
+    }
+    cursor = listed.truncated ? listed.cursor : undefined;
+  } while (cursor);
+
+  // 4. Clean up auth.enc: remove slug from email grants, delete tokens and
+  //    magic codes bound to slug
+  const mres = await mutateState(env, (state) => {
+    for (const [email, slugs] of Object.entries(state.emails)) {
+      state.emails[email] = slugs.filter((s) => s !== slug);
+      if (state.emails[email].length === 0) delete state.emails[email];
+    }
+    for (const [hash, entry] of Object.entries(state.tokens)) {
+      if (entry.slug === slug) delete state.tokens[hash];
+    }
+    for (const [hash, code] of Object.entries(state.magic)) {
+      if (code.slug === slug) delete state.magic[hash];
+    }
+  });
+  if (!mres.ok) return Response.json({ error: mres.error }, { status: 503 });
+
+  // 5. Re-scan slugs.json
+  const slugs = await getSlugs(env);
+  await writeJsonMap(env, 'slugs.json', { slugs });
+
+  // 6. Return 200 with result
+  return Response.json({
+    ok: true,
+    slug,
+    filesDeleted: deleted,
+    cfWarnings: cfErrors.length > 0 ? cfErrors : undefined,
+  }, { status: 200 });
 }
 
 /**
