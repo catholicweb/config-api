@@ -59,6 +59,14 @@
  *                                      token (see POST /auth/magic below).
  *                                      Rejects reserved slugs: api, editor, www, data
  *
+ * SITE REPROVISION (gated by admin secret — see authorizeAdmin):
+ *   POST /sites/:slug/reprovision      — re-run Cloudflare provisioning (Pages project, DNS
+ *                                      record, custom domain) + dispatch a build for an EXISTING
+ *                                      site, to repair a custom domain that isn't serving (e.g.
+ *                                      Cloudflare Error 1014 when {slug}.pages.dev has no active
+ *                                      production deployment). Does not email anyone; returns
+ *                                      the current custom-domain status.
+ *
  * EDITOR INVITE (gated by an admin secret — see authorizeAdmin):
  *   POST /sites/:slug/magic          — email an existing editor (by email) a magic link for an
  *                                       EXISTING slug, granting them edit capability. Body:
@@ -200,6 +208,18 @@ export default {
       const admin = await authorizeAdmin(env, request);
       if (!admin.ok) return Response.json({ error: admin.error }, { status: admin.status });
       return backfillCache(env);
+    }
+
+    // POST /sites/:slug/reprovision — admin-gated maintenance: re-run Cloudflare
+    // provisioning (Pages project, DNS record, custom domain) + dispatch a build
+    // for an EXISTING site, to repair a custom domain that isn't serving (e.g.
+    // Cloudflare Error 1014). Must match BEFORE the generic create route below.
+    if (method === 'POST' && segments.length === 3 && segments[2] === 'reprovision') {
+      const slug = segments[1];
+      if (!validateSlug(slug)) return new Response('Invalid slug', { status: 400 });
+      const admin = await authorizeAdmin(env, request);
+      if (!admin.ok) return Response.json({ error: admin.error }, { status: admin.status });
+      return reprovisionSite(ctx, env, slug);
     }
 
     // GET /sites — list all slugs
@@ -830,30 +850,68 @@ async function ensurePagesProject(env, slug) {
 }
 
 /**
- * Ensure a DNS CNAME record for `{slug}.parroquia.app` exists, pointing to
- * `{slug}.pages.dev`. Returns `{ ok, error? }`.
+ * Fetch the Cloudflare Pages project object for `slug` and return its actual
+ * pages.dev subdomain. This is the authoritative CNAME target: Pages may assign
+ * a random-suffixed subdomain (e.g. `plantilla-3mn.pages.dev`) when the exact
+ * `{slug}.pages.dev` name is unavailable, so we must never assume it is
+ * `{slug}.pages.dev` — pointing a custom-domain CNAME at a subdomain the project
+ * doesn't own is exactly what surfaces as Cloudflare Error 1014.
+ * Returns `{ ok, subdomain, error? }`.
  */
-async function ensureDnsRecord(env, slug) {
+async function getPagesProjectSubdomain(env, slug) {
+  const accountId = env.CLOUDFLARE_ACCOUNT_ID;
+  if (!accountId) return { ok: false, error: 'CLOUDFLARE_ACCOUNT_ID not configured' };
+
+  const res = await cfFetch(env, `/accounts/${accountId}/pages/projects/${slug}`);
+  if (!res.success) {
+    return { ok: false, error: res.errors?.[0]?.message ?? 'failed to read Pages project' };
+  }
+  const subdomain = res.result?.subdomain;
+  if (!subdomain) return { ok: false, error: 'Pages project has no subdomain' };
+  return { ok: true, subdomain };
+}
+
+/**
+ * Ensure a DNS CNAME record for `{slug}.parroquia.app` exists, pointing to the
+ * given `target` (the project's ACTUAL pages.dev subdomain, from
+ * `getPagesProjectSubdomain`), and is proxied. Verifies an existing record
+ * actually matches (content + proxied) and deletes + recreates a
+ * stale/conflicting/non-proxied record — pointing at the wrong (assumed)
+ * `{slug}.pages.dev` subdomain, or at an unclaimed target, is repaired rather
+ * than silently kept. Returns `{ ok, error?, action? }`.
+ */
+async function ensureDnsRecord(env, slug, target) {
   const zoneId = env.CLOUDFLARE_ZONE_ID;
   if (!zoneId) return { ok: false, error: 'CLOUDFLARE_ZONE_ID not configured' };
 
   const name = `${slug}.parroquia.app`;
-  const target = `${slug}.pages.dev`;
 
-  // Check for existing record.
-  const listed = await cfFetch(env, `/zones/${zoneId}/dns_records?type=CNAME&name=${encodeURIComponent(name)}`);
+  // List any existing record on this name (any type), so a conflicting or stale
+  // record is removed instead of being trusted because a CNAME "exists".
+  const listed = await cfFetch(env, `/zones/${zoneId}/dns_records?name=${encodeURIComponent(name)}`);
   if (!listed.success) {
     return { ok: false, error: listed.errors?.[0]?.message ?? 'failed to list DNS records' };
   }
-  if (listed.result.length > 0) return { ok: true };
 
-  // Create record.
+  const records = listed.result || [];
+  const good = records.find(
+    (r) => r.type === 'CNAME' && r.content === target && r.proxied === true,
+  );
+  if (good) return { ok: true, action: 'CNAME already correct' };
+
+  // No correct record — delete whatever is already there, then create the right one.
+  for (const r of records) {
+    await cfFetch(env, `/zones/${zoneId}/dns_records/${r.id}`, { method: 'DELETE' });
+  }
+
   const res = await cfFetch(env, `/zones/${zoneId}/dns_records`, {
     method: 'POST',
     body: JSON.stringify({ type: 'CNAME', name, content: target, ttl: 1, proxied: true }),
   });
-  if (res.success) return { ok: true };
-  return { ok: false, error: res.errors?.[0]?.message ?? 'failed to create DNS record' };
+  if (!res.success) {
+    return { ok: false, error: res.errors?.[0]?.message ?? 'failed to create DNS record' };
+  }
+  return { ok: true, action: records.length > 0 ? 'replaced stale/conflicting record' : 'created CNAME' };
 }
 
 /**
@@ -873,6 +931,50 @@ async function ensureCustomDomain(env, slug) {
   // 10006 = domain already attached
   if (res.errors?.[0]?.code === 10006) return { ok: true };
   return { ok: false, error: res.errors?.[0]?.message ?? 'failed to attach custom domain' };
+}
+
+/**
+ * Read the current status of the custom domain `{slug}.parroquia.app` on the
+ * Pages project `slug`. Statuses include `active`, `pending`, `initializing`,
+ * and `failed`; `not-attached` is returned when the domain isn't on the project
+ * at all. Returns `{ ok, status, error? }`.
+ */
+async function getCustomDomainStatus(env, slug) {
+  const accountId = env.CLOUDFLARE_ACCOUNT_ID;
+  if (!accountId) return { ok: false, error: 'CLOUDFLARE_ACCOUNT_ID not configured' };
+
+  const res = await cfFetch(env, `/accounts/${accountId}/pages/projects/${slug}/domains`);
+  if (!res.success) {
+    return { ok: false, error: res.errors?.[0]?.message ?? 'failed to list custom domains' };
+  }
+  const name = `${slug}.parroquia.app`;
+  const found = (res.result || []).find((d) => d.name === name);
+  return { ok: true, status: found?.status ?? 'not-attached' };
+}
+
+/**
+ * Delete then re-attach the custom domain `{slug}.parroquia.app` on the Pages
+ * project `slug`, forcing Cloudflare to re-validate it (a custom domain stuck in
+ * `initializing`/`failed` — a common Error 1014 state — is not healed by a plain
+ * re-POST that just returns 10006 "already attached"). Returns `{ ok, status }`.
+ */
+async function reattachCustomDomain(env, slug) {
+  const accountId = env.CLOUDFLARE_ACCOUNT_ID;
+  if (!accountId) return { ok: false, error: 'CLOUDFLARE_ACCOUNT_ID not configured' };
+
+  const name = `${slug}.parroquia.app`;
+  // Delete first; a missing domain is not an error worth propagating.
+  await cfFetch(env, `/accounts/${accountId}/pages/projects/${slug}/domains/${encodeURIComponent(name)}`, {
+    method: 'DELETE',
+  });
+  const res = await cfFetch(env, `/accounts/${accountId}/pages/projects/${slug}/domains`, {
+    method: 'POST',
+    body: JSON.stringify({ name }),
+  });
+  if (!res.success && res.errors?.[0]?.code !== 10006) {
+    return { ok: false, error: res.errors?.[0]?.message ?? 'failed to re-attach custom domain' };
+  }
+  return getCustomDomainStatus(env, slug);
 }
 
 // ---------------------------------------------------------------------------
@@ -993,11 +1095,29 @@ async function createSite(ctx, env, slug, email) {
   }
 
   // Provision Cloudflare resources. Each step is idempotent: it creates the
-  // resource only if missing and returns ok if it already exists.
+  // resource only if missing and returns ok if it already exists. The DNS CNAME
+  // target is the project's ACTUAL pages.dev subdomain (which Pages may have
+  // random-suffixed, e.g. `plantilla-3mn.pages.dev`), never an assumed
+  // `{slug}.pages.dev` — a CNAME aimed at a subdomain the project doesn't own is
+  // what surfaces as Cloudflare Error 1014.
   try {
+    const proj = await ensurePagesProject(env, slug);
+    if (!proj.ok) {
+      return Response.json(
+        { ok: false, error: `failed ensuring Cloudflare Pages project: ${proj.error}` },
+        { status: 502 },
+      );
+    }
+    const sub = await getPagesProjectSubdomain(env, slug);
+    if (!sub.ok) {
+      return Response.json(
+        { ok: false, error: `failed reading Pages project subdomain: ${sub.error}` },
+        { status: 502 },
+      );
+    }
+
     const steps = [
-      ['ensuring Cloudflare Pages project', () => ensurePagesProject(env, slug)],
-      ['ensuring DNS CNAME record', () => ensureDnsRecord(env, slug)],
+      ['ensuring DNS CNAME record', () => ensureDnsRecord(env, slug, sub.subdomain)],
       ['attaching custom domain to Pages project', () => ensureCustomDomain(env, slug)],
     ];
     for (const [label, fn] of steps) {
@@ -1059,7 +1179,106 @@ async function createSite(ctx, env, slug, email) {
   const slugs = await getSlugs(env);
   await writeJsonMap(env, 'slugs.json', { slugs });
 
-  return Response.json({ ok: true, slug, sent: true, email }, { status: 201 });
+  // Report the custom-domain attach status so a site that can't validate (and
+  // would surface later as Cloudflare Error 1014) is flagged at creation rather
+  // than silently kept. A brand-new domain is usually `initializing`/`pending`
+  // until the first build deploys, so only log a warning on a hard failure.
+  let domainStatus;
+  try {
+    const st = await getCustomDomainStatus(env, slug);
+    if (st.ok) domainStatus = st.status;
+  } catch {
+    /* non-fatal — DNS/list failure here shouldn't fail an otherwise-created site */
+  }
+  if (domainStatus === 'failed' || domainStatus === 'not-attached') {
+    console.log(
+      `createSite: custom domain for ${slug} is ${domainStatus}; ` +
+        'site will 1014 until the domain validates and a build deploys',
+    );
+  }
+
+  return Response.json({ ok: true, slug, sent: true, email, domainStatus }, { status: 201 });
+}
+
+/**
+ * Re-run Cloudflare provisioning for an EXISTING site to repair a state that
+ * surfaces as Cloudflare Error 1014 — most often a custom-domain CNAME aimed at
+ * an assumed `{slug}.pages.dev` rather than the project's actual (possibly
+ * random-suffixed) pages.dev subdomain. Idempotent: each ensure step only acts
+ * as needed. It repairs the DNS record to point at the project's real subdomain,
+ * re-attaches the custom domain when it isn't `active` (forcing revalidation),
+ * and dispatches a page build so the pages.dev subdomain is live. Admin-gated
+ * via `POST /sites/:slug/reprovision`. Returns `{ ok, slug, target, domainStatus,
+ * actions }`.
+ */
+async function reprovisionSite(ctx, env, slug) {
+  const actions = [];
+  try {
+    const proj = await ensurePagesProject(env, slug);
+    if (!proj.ok) {
+      return Response.json(
+        { ok: false, error: `failed ensuring Cloudflare Pages project: ${proj.error}` },
+        { status: 502 },
+      );
+    }
+    const sub = await getPagesProjectSubdomain(env, slug);
+    if (!sub.ok) {
+      return Response.json(
+        { ok: false, error: `failed reading Pages project subdomain: ${sub.error}` },
+        { status: 502 },
+      );
+    }
+    actions.push(`project subdomain: ${sub.subdomain}`);
+
+    const steps = [
+      ['ensuring DNS CNAME record', () => ensureDnsRecord(env, slug, sub.subdomain)],
+    ];
+    for (const [label, fn] of steps) {
+      const result = await fn();
+      if (!result.ok) {
+        return Response.json(
+          { ok: false, error: `failed ${label}: ${result.error}` },
+          { status: 502 },
+        );
+      }
+      if (result.action) actions.push(`${label}: ${result.action}`);
+    }
+
+    // Ensure the custom domain is attached; then, if it isn't live, delete and
+    // re-attach it to force Cloudflare to re-validate against a fresh pages.dev.
+    const attached = await ensureCustomDomain(env, slug);
+    if (!attached.ok) {
+      return Response.json(
+        { ok: false, error: `failed attaching custom domain: ${attached.error}` },
+        { status: 502 },
+      );
+    }
+    let domainStatus = (await getCustomDomainStatus(env, slug)).status;
+    if (domainStatus !== 'active') {
+      const reattached = await reattachCustomDomain(env, slug);
+      if (!reattached.ok) {
+        return Response.json(
+          { ok: false, error: `failed re-attaching custom domain: ${reattached.error}` },
+          { status: 502 },
+        );
+      }
+      domainStatus = reattached.status;
+      actions.push('custom domain: re-attached to force revalidation');
+    } else {
+      actions.push('custom domain: already active');
+    }
+
+    // Ensure the pages.dev subdomain gets an active production deployment.
+    if (ctx?.waitUntil) ctx.waitUntil(githubDispatch(env, slug));
+    actions.push('dispatched page build');
+
+    return Response.json({ ok: true, slug, target: sub.subdomain, domainStatus, actions }, { status: 200 });
+  } catch (err) {
+    return Response.json(
+      { ok: false, error: `failed during Cloudflare reprovisioning: ${err.message}` },
+      { status: 502 },
+    );
+  }
 }
 
 /**

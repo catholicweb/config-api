@@ -84,8 +84,16 @@ Key helper groups (each has a `// ---` banner comment):
   it never lives in the public `config.json`. `issueMagicLink`
   only mints a login link; granting is explicit (`createSite` seed,
   `POST /sites/:slug/editors`).
-- **Cloudflare provisioning** — `cfFetch`, `ensurePagesProject`, `ensureDnsRecord`,
-  `ensureCustomDomain`. One idempotent "ensure" step per Cloudflare resource.
+- **Cloudflare provisioning** — `cfFetch`, `ensurePagesProject`,
+  `getPagesProjectSubdomain`, `ensureDnsRecord`, `ensureCustomDomain`, plus
+  `getCustomDomainStatus`/`reattachCustomDomain` and the admin-gated
+  `reprovisionSite` (route `POST /sites/:slug/reprovision`). One idempotent
+  "ensure" step per Cloudflare resource. The DNS CNAME target is the project's
+  **actual** pages.dev subdomain from `getPagesProjectSubdomain` (Pages may
+  random-suffix it, e.g. `plantilla-3mn`), never an assumed `{slug}.pages.dev`.
+  `ensureDnsRecord` verifies an existing CNAME matches (content + `proxied`),
+  deleting + recreating a stale or conflicting record instead of trusting any
+  pre-existing CNAME.
 - **Handlers** — one per endpoint.
 
 ## Security invariants (do not break)
@@ -140,10 +148,22 @@ Key helper groups (each has a `// ---` banner comment):
   route without reconsidering the auth model — `readFile` already requires an
   editor token, so wiring it up would change the public-read invariant.
 - **Site creation provisions Cloudflare resources** via the API (Pages project,
-  DNS CNAME `{slug}.parroquia.app` → `{slug}.pages.dev`, custom domain attach),
-  each step idempotent. It requires `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`,
-  `CLOUDFLARE_ZONE_ID` secrets. It then seeds the site from the **bucket-root
-  `config.json` template** (copied to `<slug>/config.json`; a `503` if the template
-  is missing) and returns the minted token only once.
+  DNS CNAME `{slug}.parroquia.app` → the project's **actual** pages.dev subdomain,
+  custom domain attach), each step idempotent. It requires `CLOUDFLARE_API_TOKEN`,
+  `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_ZONE_ID` secrets. It then seeds the site
+  from the **bucket-root `config.json` template** (copied to `<slug>/config.json`;
+  a `503` if the template is missing) and returns the minted token only once. The
+  `201` also reports the custom-domain `domainStatus` so a site that can't
+  validate is flagged at creation.
+- **Error 1014 gotcha.** Pages assigns each project a pages.dev subdomain,
+  random-suffixed when the exact `{slug}.pages.dev` name is taken (e.g.
+  `plantilla-3mn`, `base-1ef`). A custom-domain CNAME aimed at an **assumed**
+  `{slug}.pages.dev` that the project doesn't own surfaces Cloudflare **Error 1014
+  ("CNAME Cross-User Banned")** and the domain stays `pending`. The worker reads
+  the real subdomain via `getPagesProjectSubdomain` and points the CNAME at that.
+  Diagnose a mismatch with the read-only `diag-sites.mjs`; repair existing sites
+  with admin-gated `POST /sites/:slug/reprovision` (`reprovisionSite`), which
+  re-runs provisioning against the real subdomain, re-attaches a non-`active`
+  custom domain to force revalidation, and dispatches a build.
 - **`slugs.json`** is re-scanned from the bucket on every creation so it always
   matches `/sites/list`, not just an append.
