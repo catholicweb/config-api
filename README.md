@@ -328,7 +328,7 @@ the old public `auth.json`/`magic.json`/`emails.json` are never read or deleted
 | `editor/.../theme/lib/codec.js` | token encode/validate |
 | `editor/.../theme/lib/api.js` | endpoint definitions, auth headers |
 | `editor/.../theme/lib/patch.js` | **mirrored byte-for-byte** with `config-api/src/patch.js` (diff/apply convention); the editor's `diff` half |
-| `editor/.../theme/lib/schema.js` | `UUID_KEY` / `injectUuid` — must equal `UUID_KEY` in the patch mirrors |
+| `editor/.../theme/lib/schema.js` | `ID_KEY` / `injectId` — must equal `ID_KEY` in the patch mirrors |
 | `web-template/.../migrate.js` | token encode/validate, endpoint definitions, R2 layout |
 
 Before changing **any** of: token rules, an endpoint, or the R2 layout, update
@@ -361,30 +361,30 @@ The diff/apply convention lives in `src/patch.js`, **mirrored byte-for-byte** wi
 `editor/.../theme/lib/patch.js` (same pattern as `codec.js`). It is 100%
 **data-guided** — no schema is needed on the server:
 
-- An array whose every item is a plain object with a non-empty string `uuid` is
-  a **keyed** list → diffed/addressed by that stable uuid. The editor's schema
-  injects a hidden `uuid` default into every object-list/block-list (see
+- An array whose every item is a plain object with a non-empty string `id` is
+  a **keyed** list → diffed/addressed by that stable id. The editor's schema
+  injects a hidden `id` default into every object-list/block-list (see
   `schema.js`), so per-field edits within an item are last-edit-wins even against
   a concurrently-updated base, and a concurrently-removed item is never
-  resurrected (a `{ uuid }` that no longer resolves is a harmless no-op).
-- **Any other array** (scalars, or objects lacking `uuid`) is **keyless** → on
+  resurrected (a `{ id }` that no longer resolves is a harmless no-op).
+- **Any other array** (scalars, or objects lacking `id`) is **keyless** → on
   change it is replaced wholesale by one absolute `set`.
 
-Op vocabulary (a `path` is an array of string keys and/or `{ uuid }` segments):
+Op vocabulary (a `path` is an array of string keys and/or `{ id }` segments):
 
 | Op | Shape | Meaning |
 |----|-------|---------|
 | `set` | `{ op, path, value }` | absolute-assign at `path` |
-| `remove` | `{ op, path }` | delete an object key, or (last segment `{ uuid }`) remove that keyed list item; no-op if absent |
-| `listAdd` | `{ op, path, uuid, index, value }` | insert a new keyed item |
-| `listReorder` | `{ op, path, uuids }` | set the list's uuid order (appends any current items not named, so concurrent adds are never dropped) |
+| `remove` | `{ op, path }` | delete an object key, or (last segment `{ id }`) remove that keyed list item; no-op if absent |
+| `listAdd` | `{ op, path, id, index, value }` | insert a new keyed item |
+| `listReorder` | `{ op, path, ids }` | set the list's id order (appends any current items not named, so concurrent adds are never dropped) |
 
 The endpoint returns `{ ok, slug, key, data, skipped }`, where `data` is the
 **merged** document — the editor adopts it back to preserve multi-editor
 freshness and to pick up server-side additions.
 
 **First save after the editor loads is still a full `PUT`** (hydration): the
-`PUT` persists the schema-backfilled uuids server-side so subsequent `{ uuid }`
+`PUT` persists the schema-backfilled ids server-side so subsequent `{ id }`
 patch ops can resolve. Only later saves are patches.
 
 **Known trade-off:** two concurrent PATCHes that read the same base can, at the

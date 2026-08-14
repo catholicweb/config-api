@@ -367,7 +367,7 @@ export default {
       const token = segments[2];
       if (!validateToken(token)) return new Response('Invalid token', { status: 400 });
 
-      const auth = await authorize(env, slug, request);
+      const auth = await authorizeAdminOrEditor(env, slug, request);
       if (!auth.ok) return Response.json({ error: auth.error }, { status: auth.status });
 
       return putFile(ctx, env, slug, token, request);
