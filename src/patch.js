@@ -278,7 +278,7 @@ function indexById(arr, id) {
     }
     idIndexCache.set(arr, map);
   }
-  const idx = map.get(uuid);
+  const idx = map.get(id);
   return idx === undefined ? -1 : idx;
 }
 
