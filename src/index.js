@@ -938,14 +938,15 @@ async function siteExists(env, slug) {
   if (await env.CONTENT.head(`${slug}/${SITE_MARKER}`)) return true;
   const listed = await env.CONTENT.list({ prefix: `${slug}/`, limit: 1 });
   if (listed.objects.length > 0) return true;
+  return false
   // Legacy pre-marker slugs (a token/grant existed without a .site marker).
-  const state = await readAuthState(env);
+  /*const state = await readAuthState(env);
   if (!state) return false;
   for (const e of Object.values(state.tokens)) if (e && e.slug === slug) return true;
   for (const slugs of Object.values(state.emails)) {
     if (Array.isArray(slugs) && slugs.includes(slug)) return true;
   }
-  return false;
+  return false;*/
 }
 
 /**
@@ -1016,11 +1017,11 @@ async function createSite(ctx, env, slug, email) {
     );
   }
 
-  // Seed the site's config.json from the root template. This is the default
+  // Seed the site's config.json from the 'plantilla' template. This is the default
   // content the site starts with; the editor then edits it as any other file.
-  // The template lives at the bucket root (a separate key from each site's
-  // <slug>/config.json), so it is never served under a slug prefix.
-  const template = await env.CONTENT.get('config.json');
+  // The template lives at plantilla/config (a separate key from each site's
+  // <slug>/config.json)
+  const template = await env.CONTENT.get('plantilla/config.json');
   if (!template) {
     return Response.json(
       { ok: false, error: 'site template config.json not configured at bucket root' },
