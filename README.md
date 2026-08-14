@@ -250,6 +250,37 @@ means any editor can mint new sites and email invites to arbitrary addresses —
 intended widening of the capability boundary, but worth knowing before granting
 editor access to untrusted users.
 
+### Page build & the Error 1014 custom-domain gotcha
+
+A Pages custom domain (`{slug}.parroquia.app`) is served through a **proxied
+CNAME pointing at the Pages project's actual `.pages.dev` subdomain**. Cloudflare
+Pages assigns each project a pages.dev subdomain automatically — usually
+`{slug}.pages.dev`, but it appends a **random suffix** (e.g. `plantilla-3mn`,
+`base-1ef`) when the exact name is unavailable. The worker reads the project's
+real subdomain (`getPagesProjectSubdomain`) and points the CNAME at **that**, so
+the custom domain only becomes `active` once the project has a successful
+production deployment (the `web-template` build workflow deploys automatically on
+site creation and on every `config.json` save).
+
+If instead a custom domain is pointed at an **assumed** `{slug}.pages.dev` that
+the project doesn't actually own (its real subdomain is suffixed), Cloudflare
+serves **Error 1014 ("CNAME Cross-User Banned")** on `https://{slug}.parroquia.app/`
+and the domain stays `pending` — the CNAME resolves to an unclaimed/foreign
+hostname Cloudflare can't attribute to the zone. This was a real bug: the old
+code hardcoded `{slug}.pages.dev` as the CNAME target.
+
+- **Diagnose:** `CLOUDFLARE_API_TOKEN=… CLOUDFLARE_ACCOUNT_ID=… CLOUDFLARE_ZONE_ID=…
+  node diag-sites.mjs [slug …]` prints, per slug, the Pages project's real
+  subdomain vs the current CNAME target, the latest production deployment status,
+  the custom-domain status, and the zone DNS records (read-only — GET only).
+  A mismatch between the project subdomain and the CNAME target means 1014.
+- **Repair:** admin-gated `POST /sites/:slug/reprovision` re-runs provisioning
+  (Pages project, then the DNS record — verified/generated against the project's
+  **real** subdomain — then the custom domain), re-attaches the custom domain when
+  it isn't `active` to force revalidation, and dispatches a build. It returns the
+  `target` used, `domainStatus`, and a list of `actions`. Confirm with
+  `curl -sI https://{slug}.parroquia.app/` → `200` (not `error code: 1014`).
+
 ## Token encoding
 
 File keys are **flat, validated filenames** — **not base64**, not opaque random
