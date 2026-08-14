@@ -20,6 +20,11 @@
  * codec.js, api.js, and migrate.js.
  */
 
+// Mirrored byte-for-byte with editor/docs/.vitepress/theme/lib/patch.js
+// (could be regarded as a part of the same inter-dependency contract):
+// applyPatch applies the editor's diff ops onto the stored doc.
+import { applyPatch } from './patch.js';
+
 /**
  * parroquia-config-api
  *
@@ -317,6 +322,19 @@ export default {
       if (!auth.ok) return Response.json({ error: auth.error }, { status: auth.status });
 
       return updateEditor(env, request, slug);
+    }
+
+    // PATCH /sites/:slug/config.json — apply a small diff to config.json
+    // (editor-authed). Scoped to config.json, the only file the editor edits
+    // concurrently; a full PUT of config.json still works as before.
+    if (method === 'PATCH' && segments.length === 3 && segments[2] === 'config.json') {
+      const slug = segments[1];
+      if (!validateSlug(slug)) return new Response('Invalid slug', { status: 400 });
+
+      const auth = await authorize(env, slug, request);
+      if (!auth.ok) return Response.json({ error: auth.error }, { status: auth.status });
+
+      return patchConfigFile(ctx, env, slug, request);
     }
 
     // PUT /sites/:slug/:token — write a file (editor-authed)
@@ -1702,6 +1720,48 @@ async function putFile(ctx, env, slug, token, request) {
   // `url` is the absolute public URL of the stored file, so a client that just
   // uploaded media can use it directly as the field value.
   return Response.json({ ok: true, slug, key, url: fileUrl(env, slug, token) }, { status: 200 });
+}
+
+// PATCH /sites/:slug/config.json — apply a small diff to the stored config.json.
+// The editor sends absolute ops (see editor lib/patch.js and its mirror
+// src/patch.js); they are applied onto the CURRENT stored document so per-field
+// edits are truly last-edit-wins even against a concurrently-updated base. Returns
+// the merged doc so the editor can adopt other editors' changes. Scoped to
+// config.json (the only file the editor edits concurrently).
+async function patchConfigFile(ctx, env, slug, request) {
+  const key = `${slug}/config.json`;
+  if (!key.startsWith(`${slug}/`)) {
+    return new Response('Invalid path', { status: 400 });
+  }
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return Response.json({ ok: false, error: 'Invalid JSON body' }, { status: 400 });
+  }
+  if (!Array.isArray(body?.ops) || body.ops.length === 0) {
+    return Response.json({ ok: false, error: 'ops array required' }, { status: 400 });
+  }
+  const obj = await env.CONTENT.get(key);
+  if (!obj) return new Response('Not Found', { status: 404 });
+  let doc;
+  try {
+    doc = JSON.parse(await obj.text());
+  } catch {
+    return Response.json(
+      { ok: false, error: 'Stored config.json is invalid JSON' },
+      { status: 500 }
+    );
+  }
+  // applyPatch mutates `doc` in place (only allocation is parse/stringify).
+  const { data, skipped } = applyPatch(doc, body.ops);
+  const text = JSON.stringify(data, null, 2) + '\n';
+  await env.CONTENT.put(key, text, {
+    httpMetadata: { contentType: 'application/json; charset=utf-8', cacheControl: CACHE_REVALIDATE },
+  });
+  // Auto-build: same as a config.json PUT (best-effort, fire-and-forget).
+  if (ctx?.waitUntil) ctx.waitUntil(githubDispatch(env, slug));
+  return Response.json({ ok: true, slug, key, data, skipped }, { status: 200 });
 }
 
 // Admin-gated maintenance: rewrite every object's httpMetadata.cacheControl so the
