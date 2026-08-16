@@ -1411,7 +1411,7 @@ async function reprovisionSite(ctx, env, slug) {
       );
     }
     const dom = await getCustomDomainStatus(env, slug);
-    const domainStatus = dom.ok ? dom.status : undefined;
+    let domainStatus = dom.ok ? dom.status : undefined;
     if (domainStatus !== 'active') {
       const reattached = await reattachCustomDomain(env, slug);
       if (!reattached.ok) {
@@ -1881,7 +1881,7 @@ async function sendMagicLinkEmail(env, email, slugs, code) {
   const slugList = slugs.length === 1 ? slugs[0] : `${slugs.length} sitios`;
   const subject = slugs.length === 1
     ? `Tu enlace de acceso a ${slugs[0]}`
-    : 'Tus enlaces de acceso a Parroquia';
+    : 'Tus enlaces de acceso a Parroquia.app';
 
   // Worker logs are not public — this makes the code clickable during local dev.
   console.log(`[magic-link] slugs=${slugs.join(',')} to=${email} link=${link}`);
@@ -1904,12 +1904,9 @@ async function sendMagicLinkEmail(env, email, slugs, code) {
   <table width="100%" cellpadding="0" cellspacing="0" style="background:#f5f5f5;"><tr><td align="center">
     <table width="600" cellpadding="0" cellspacing="0" style="background:#fff;border-radius:8px;margin:24px 16px;padding:32px 24px;">
       <tr><td>
-        <h1 style="margin:0 0 16px;color:#1a1a1a;font-size:22px;">¡Bienvenido/a a Parroquia! 🎉</h1>
+        <h1 style="margin:0 0 16px;color:#1a1a1a;font-size:22px;">¡Bienvenido a Parroquia.app! 🎉</h1>
         <p style="margin:0 0 16px;color:#444;font-size:16px;line-height:1.5;">
-          Qué alegría tener tu parroquia en internet. Ya puedes entrar en el editor para gestionar tu sitio web.
-        </p>
-        <p style="margin:0 0 12px;color:#444;font-size:16px;line-height:1.5;">
-          <strong>Tu${slugs.length === 1 ? ' sitio' : 's sitios'}:</strong>
+          ¡Qué alegría tener tu parroquia en internet! Ya puedes entrar en el editor para gestionar tu${slugs.length === 1 ? ' sitio' : 's sitios'} web:
         </p>
         <ul style="margin:0 0 24px;padding-left:20px;">${htmlSlugs}</ul>
         <p style="margin:0 0 24px;color:#444;font-size:16px;line-height:1.5;">
