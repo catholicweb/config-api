@@ -44,7 +44,6 @@ the code ever disagree, **the code wins** and this README must be corrected.
 | GET    | `/sites/list`            | —               | —                                                  | `200 { slugs: [...] }` *(legacy alias of `/sites`)* |
 | GET    | `/sites/:slug/list`      | —               | `:slug` validated (see slug rules)                 | `200 { slug, files: [...] }` / `400` *(legacy alias of `/sites/:slug`)* |
 | POST   | `/sites/:slug`           | `Bearer admin | editor` | `:slug` validated, not reserved; body `{ "email": "<addr>" }` — open to the admin or any editor who can edit at least one slug; provisions Cloudflare, copies the root `config.json` template into the site, grants `<email>` edit access, and emails a one-time magic link | `201 { ok, slug, sent, email }` / `400/401/403/409/502/503` |
-| POST   | `/sites/:slug/magic`     | —               | `:slug` must exist; body `{ "email": "<addr>" }` — email a one-time magic **login** link; does NOT grant access | `200 { ok, slug, sent, email }` / `400/404/502/503` |
 | POST   | `/sites/:slug/editors`   | `Bearer editor | admin` | `:slug` must exist; body `{ "email": "<addr>" }` — grant `<email>` edit access to the slug and email an invite/login link | `200 { ok, slug, sent, email }` / `400/401/403/404/502/503` |
 | GET    | `/sites/:slug/editors`   | `Bearer editor | admin` | `:slug` must exist — list the emails granted write access to **this** slug only | `200 { ok, slug, editors: [...] }` / `400/401/403/404/503` |
 | PATCH  | `/sites/:slug/editors`   | `Bearer editor | admin` | `:slug` must exist; body `{ "from": "<old>", "to": "<new>" }` — change an editor's email: re-grants `to` and re-binds `from`'s tokens so existing sessions keep working | `200 { ok, slug, from, to }` / `400/401/403/404/503` |
@@ -54,9 +53,9 @@ the code ever disagree, **the code wins** and this README must be corrected.
 | POST   | `/sites/backfill-cache`  | `Bearer admin`  | — maintenance: re-stamp `Cache-Control` metadata onto every existing bucket object so `data.parroquia.app` caches them (idempotent) | `200 { ok, updated, skipped }` / `401/403/503` |
 | POST   | `/sites/:slug/clone`    | `Bearer admin`  | body `{ "targetSlug": "<slug>" }` — clone all content (files, email grants, config.json media URL rewriting) from an existing slug to a new slug; provisions Cloudflare for the target; does not modify the source | `201 { ok, sourceSlug, targetSlug, filesCopied, domainStatus }` / `400/401/403/404/409/502/503` |
 | DELETE | `/sites/:slug`          | `Bearer admin`  | — delete a site entirely: best-effort Cloudflare resource cleanup, then remove all R2 content, clean up auth.enc grants/tokens/magic, re-scan slugs.json | `200 { ok, slug, filesDeleted, cfWarnings? }` / `400/401/403/404/503` |
-| PUT    | `/sites/:slug/:token`    | `Bearer editor` | body = raw bytes, `Content-Type` optional. Writing `config.json` also triggers an automatic page build (best-effort, see [Auto-build](#auto-build)) | `200 { ok, slug, key }` / `400/401/403` |
+| PUT    | `/sites/:slug/:token`    | `Bearer editor | admin` | body = raw bytes, `Content-Type` optional. Writing `config.json` also triggers an automatic page build (best-effort, see [Auto-build](#auto-build)) | `200 { ok, slug, key }` / `400/401/403` |
 | PATCH  | `/sites/:slug/config.json` | `Bearer editor` | body `{ "ops": [...] }` — apply a small **diff** onto the currently stored `config.json` and return the merged doc (used by the editor for small, per-field, last-edit-wins concurrent saves; see [Patch saves](#patch-saves)). Also triggers an automatic page build | `200 { ok, slug, key, data, skipped }` / `400/401/403/404/500` |
-| DELETE | `/sites/:slug/:token`    | `Bearer editor` | —                                                  | `200 { ok, slug, key }` / `400/401/403` |
+| DELETE | `/sites/:slug/:token`    | `Bearer editor | admin` | —                                                  | `200 { ok, slug, key }` / `400/401/403` |
 
 **Reserved slugs** (rejected on site creation and cloning): `api`, `editor`, `www`, `data`.
 
@@ -241,10 +240,6 @@ ability to onboard others):
   target email and re-binds the source's tokens to it, so the editor keeps their
   existing logged-in sessions across the address change.
 
-**Requesting a fresh login link** (`POST /sites/:slug/magic`) is open to all and only
-emails a link — it does **not** grant anything. The redeemed token only works if the
-address is already in the slug's email grant.
-
 **Email-only login** (`POST /auth/request`) removes the slug from the request: the
 editor asks only for the address, and this endpoint emails a login link to **every**
 slug that address is granted (one link per slug). It never grants anything, and it
@@ -334,8 +329,8 @@ the old public `auth.json`/`magic.json`/`emails.json` are never read or deleted
 Before changing **any** of: token rules, an endpoint, or the R2 layout, update
 this README **and** every file above.
 
-The magic-link + editor-permissions changes add `POST /auth/magic`,
-`POST /sites/:slug/magic` (open login link) and the editor-management endpoints
+The magic-link + editor-permissions changes add `POST /auth/magic` and the
+editor-management endpoints
 (`GET`/`POST`/`PATCH`/`DELETE /sites/:slug/editors`), and change the
 `POST /sites/:slug` body; `PUT`/`DELETE` file endpoints are unchanged. All credential
 storage moved into the single encrypted `auth.enc` (see R2 layout). `codec.js` needs

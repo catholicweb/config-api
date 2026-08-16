@@ -72,11 +72,6 @@ import { applyPatch } from './patch.js';
  *                                      production deployment). Does not email anyone; returns
  *                                      the current custom-domain status.
  *
- * EDITOR INVITE (gated by an admin secret — see authorizeAdmin):
- *   POST /sites/:slug/magic          — email an existing editor (by email) a magic link for an
- *                                       EXISTING slug, granting them edit capability. Body:
- *                                       { "email": "<addr>" }. No provisioning or creation.
- *
  * MAGIC-LINK LOGIN (no auth — possession of the one-time code from the email is the proof):
  *   POST /auth/magic                 — exchange a one-time magic code (from the emailed link)
  *                                       for a fresh 256-bit editor token. The code lives in the
@@ -88,7 +83,7 @@ import { applyPatch } from './patch.js';
  *                                       email-only login). Body: { "email": "<addr>" }. Never
  *                                       grants access; returns a generic success either way.
  *
- * WRITE (editor bearer token required):
+ * WRITE (admin OR editor bearer token required):
  *   PUT    /sites/:slug/:filename   — overwrite a file (filename = validated human-readable name)
  *   DELETE /sites/:slug/:filename   — delete a file
  *
@@ -194,9 +189,9 @@ export default {
     }
 
     // POST /auth/request — email a magic login link to every site the address
-    // already has edit access to. Open to all (like /sites/:slug/magic): it only
-    // issues links and never grants access. The slug is resolved server-side from
-    // the email grant, so the editor can offer an email-only login screen.
+    // already has edit access to. Open to all: it only issues links and never
+    // grants access. The slug is resolved server-side from the email grant, so
+    // the editor can offer an email-only login screen.
     if (segments.length === 2 && segments[0] === 'auth' && segments[1] === 'request' && method === 'POST') {
       return requestMagicLink(env, request);
     }
@@ -282,14 +277,6 @@ export default {
       return createSite(ctx, env, slug, email);
     }
 
-    // POST /sites/:slug/magic — issue a magic login link to an existing slug.
-    // Open to all (no admin/editor required): issuing a link does not grant
-    // access, which is still gated by the email grant checked at authorize after
-    // the code is redeemed.
-    if (method === 'POST' && segments.length === 3 && segments[2] === 'magic') {
-      return loginMagic(env, request, segments[1]);
-    }
-
     // POST /sites/:slug/editors — grant an email editor access to an existing
     // slug and email them an invite/login link. Editor-gated: write permission
     // to the slug is enough to add new editor emails (they can already do
@@ -360,7 +347,7 @@ export default {
       return patchConfigFile(ctx, env, slug, request);
     }
 
-    // PUT /sites/:slug/:token — write a file (editor-authed)
+    // PUT /sites/:slug/:token — write a file (admin or editor)
     if (method === 'PUT' && segments.length === 3) {
       const slug = segments[1];
       if (!validateSlug(slug)) return new Response('Invalid slug', { status: 400 });
@@ -373,14 +360,14 @@ export default {
       return putFile(ctx, env, slug, token, request);
     }
 
-    // DELETE /sites/:slug/:token — delete a file (editor-authed)
+    // DELETE /sites/:slug/:token — delete a file (admin OR editor, matching PUT)
     if (method === 'DELETE' && segments.length === 3) {
       const slug = segments[1];
       if (!validateSlug(slug)) return new Response('Invalid slug', { status: 400 });
       const token = segments[2];
       if (!validateToken(token)) return new Response('Invalid token', { status: 400 });
 
-      const auth = await authorize(env, slug, request);
+      const auth = await authorizeAdminOrEditor(env, slug, request);
       if (!auth.ok) return Response.json({ error: auth.error }, { status: auth.status });
 
       return deleteFile(env, slug, token);
@@ -388,10 +375,10 @@ export default {
 
     return new Response('Not Found', { status: 404 });
     } catch (err) {
-      return Response.json(
-        { error: 'internal error', detail: String(err?.message ?? err).slice(0, 200) },
-        { status: 500 },
-      );
+      // Log for the operator; never echo internals (paths, messages, secrets) to
+      // the caller — that is exactly the detail an attacker probes with.
+      console.error('unhandled worker error:', err);
+      return Response.json({ error: 'internal error' }, { status: 500 });
     }
   },
 };
@@ -449,7 +436,7 @@ function validateToken(token) {
 }
 
 function validateSlugNotReserved(slug) {
-  return !RESERVED_SLUGS.has(slug.toLowerCase());
+  return !RESERVED_SLUGS.has(slug);
 }
 
 // Public origin that serves file bytes (no auth) at /:slug/:token — the home of
@@ -624,10 +611,29 @@ async function readAuthState(env) {
   return decryptState(env, blob);
 }
 
+// Drop state that can never be used again, so the single auth.enc blob does not
+// grow without bound (it is read+decrypted on every authed request and rewritten
+// on every mutation — smaller store = less CPU/bytes per op):
+//   - expired pending magic codes (a code past its TTL already refuses to redeem);
+//   - tokens whose bound email no longer exists in the grant allowlist (such a
+//     token is unreachable — authorize() requires the email's grant to contain
+//     the target slug — so keeping it only bloats the store). Email-less
+//     defensive tokens are retained; they are a legacy artifact, not an orphan.
+function pruneAuthState(state) {
+  const now = Date.now();
+  for (const [hash, code] of Object.entries(state.magic)) {
+    if (code && typeof code.exp === 'number' && code.exp < now) delete state.magic[hash];
+  }
+  for (const [hash, entry] of Object.entries(state.tokens)) {
+    if (entry && entry.email != null && !state.emails[entry.email]) delete state.tokens[hash];
+  }
+}
+
 // Write the whole auth store back as a single encrypted blob. Returns
 // { ok:true, error:null } on success, or { ok:false, error } when AUTH_KEY is
 // missing/invalid and the store can't be encrypted. Never throws.
 async function writeAuthState(env, state) {
+  pruneAuthState(state);
   const blob = await encryptState(env, state);
   if (!blob) {
     return { ok: false, error: 'auth encryption key not configured (AUTH_KEY not set or invalid)' };
@@ -659,11 +665,29 @@ async function readJsonBody(request) {
     return { ok: false, error: 'unreadable body' };
   }
   if (!text) return { ok: false, error: 'missing JSON body' };
+  if (text.length > MAX_JSON_BODY) return { ok: false, error: 'request body too large' };
   try {
     return { ok: true, data: JSON.parse(text) };
   } catch {
     return { ok: false, error: 'invalid JSON body' };
   }
+}
+
+// Wrap a streamed request body so it errors once it exceeds `max` bytes. The
+// request body is counted by the platform and capped independently, but capping
+// here too bounds how much the worker buffers/forwards even when a client lies
+// about Content-Length. Throws the BODY_TOO_LARGE marker so putFile can answer a
+// clean 413 instead of surfacing a generic 500.
+function cappedBody(stream, max) {
+  let size = 0;
+  const ts = new TransformStream({
+    transform(chunk, controller) {
+      size += chunk.length;
+      if (size > max) controller.error(new Error(BODY_TOO_LARGE));
+      else controller.enqueue(chunk);
+    },
+  });
+  return stream.pipeThrough(ts);
 }
 
 // ---------------------------------------------------------------------------
@@ -1112,6 +1136,17 @@ const CACHE_IMMUTABLE = 'public, max-age=31536000, immutable';
 const CACHE_REVALIDATE = 'public, max-age=0, must-revalidate';
 const LIVING_FILES = new Set(['config.json', 'slugs.json']);
 
+// Request-body size caps. Every endpoint reads caller-supplied bytes into memory
+// before use; uncapped bodies are a memory/CPU/cost abuse vector (the JSON paths
+// are parsed, so a giant body is CPU work too). Config/media are the large ones;
+// the small JSON control bodies cap tight. Content-Length may lie, so putFile also
+// enforces the cap on the live stream (see cappedBody). Marker distinguishes a
+// raised cap from any other stream failure so the handler can answer 413 cleanly.
+const MAX_JSON_BODY = 1024 * 1024; // 1 MiB — auth/editors/clone/create JSON bodies
+const MAX_PATCH_BODY = 5 * 1024 * 1024; // 5 MiB — config.json patch op payloads
+const MAX_FILE_BYTE = 20 * 1024 * 1024; // 20 MiB — file content (PUT)
+const BODY_TOO_LARGE = 'parroquia:body-too-large';
+
 // Auto-build: where to dispatch the deploy workflow when a site's config.json is
 // written. The workflow (web-template/.github/workflows/deploy.yml) accepts a
 // required `site_slug` input, then builds + deploys the page to Cloudflare Pages.
@@ -1141,19 +1176,36 @@ async function getSlugs(env) {
   return slugs;
 }
 
-async function siteExists(env, slug) {
-  if (await env.CONTENT.head(`${slug}/${SITE_MARKER}`)) return true;
-  const listed = await env.CONTENT.list({ prefix: `${slug}/`, limit: 1 });
-  if (listed.objects.length > 0) return true;
-  return false
-  // Legacy pre-marker slugs (a token/grant existed without a .site marker).
-  /*const state = await readAuthState(env);
-  if (!state) return false;
-  for (const e of Object.values(state.tokens)) if (e && e.slug === slug) return true;
-  for (const slugs of Object.values(state.emails)) {
-    if (Array.isArray(slugs) && slugs.includes(slug)) return true;
+/**
+ * Maintain slugs.json incrementally (1 get + 1 put, no full bucket scan).
+ * Reads the current artifact, applies add/remove, writes back. If slugs.json is
+ * absent or corrupt the first time through, seeds it from a one-time live scan
+ * via getSlugs so the file is never stale even after a manual bucket wipe.
+ */
+async function updateSlugsJson(env, { add, remove } = {}) {
+  let slugs = [];
+  const obj = await env.CONTENT.get('slugs.json');
+  if (obj) {
+    try {
+      const parsed = JSON.parse(await obj.text());
+      if (Array.isArray(parsed?.slugs)) slugs = parsed.slugs.filter((s) => typeof s === 'string');
+    } catch { /* corrupt — fall through to seed below */ }
   }
-  return false;*/
+  // If we still have nothing (missing or corrupt), seed once from a live scan.
+  if (slugs.length === 0) {
+    slugs = await getSlugs(env);
+  }
+  if (add && !slugs.includes(add)) slugs.push(add);
+  if (remove) slugs = slugs.filter((s) => s !== remove);
+  await writeJsonMap(env, 'slugs.json', { slugs });
+}
+
+async function siteExists(env, slug) {
+  // .site markers are created on every site creation and clone, so the marker
+  // head is authoritative and one R2 op (no list fallback). An old pre-marker
+  // slug would read as absent here; the marker has existed for every site
+  // created through this worker.
+  return !!(await env.CONTENT.head(`${slug}/${SITE_MARKER}`));
 }
 
 /**
@@ -1244,7 +1296,7 @@ async function createSite(ctx, env, slug, email) {
 
   // Seed the site's config.json from the 'plantilla' template. This is the default
   // content the site starts with; the editor then edits it as any other file.
-  // The template lives at plantilla/config (a separate key from each site's
+  // The template lives at plantilla/config.json (a separate key from each site's
   // <slug>/config.json)
   const template = await env.CONTENT.get('plantilla/config.json');
   if (!template) {
@@ -1282,8 +1334,7 @@ async function createSite(ctx, env, slug, email) {
   // Write the authoritative slugs.json at the bucket root (same shape as the
   // GET /sites/list response). We re-scan the bucket so the file is always
   // consistent with reality, not just an append of the current creation.
-  const slugs = await getSlugs(env);
-  await writeJsonMap(env, 'slugs.json', { slugs });
+  await updateSlugsJson(env, { add: slug });
 
   // Report the custom-domain attach status so a site that can't validate (and
   // would surface later as Cloudflare Error 1014) is flagged at creation rather
@@ -1359,7 +1410,8 @@ async function reprovisionSite(ctx, env, slug) {
         { status: 502 },
       );
     }
-    let domainStatus = (await getCustomDomainStatus(env, slug)).status;
+    const dom = await getCustomDomainStatus(env, slug);
+    const domainStatus = dom.ok ? dom.status : undefined;
     if (domainStatus !== 'active') {
       const reattached = await reattachCustomDomain(env, slug);
       if (!reattached.ok) {
@@ -1518,9 +1570,8 @@ async function cloneSite(ctx, env, sourceSlug, request) {
     ctx.waitUntil(githubDispatch(env, targetSlug));
   }
 
-  // 9. Re-scan slugs.json from bucket
-  const slugs = await getSlugs(env);
-  await writeJsonMap(env, 'slugs.json', { slugs });
+  // 9. Update slugs.json incrementally
+  await updateSlugsJson(env, { add: targetSlug });
 
   // 10. Return 201 with details
   return Response.json({
@@ -1594,9 +1645,8 @@ async function deleteSite(ctx, env, slug) {
   });
   if (!mres.ok) return Response.json({ error: mres.error }, { status: 503 });
 
-  // 5. Re-scan slugs.json
-  const slugs = await getSlugs(env);
-  await writeJsonMap(env, 'slugs.json', { slugs });
+  // 5. Update slugs.json incrementally
+  await updateSlugsJson(env, { remove: slug });
 
   // 6. Return 200 with result
   return Response.json({
@@ -1643,36 +1693,9 @@ async function issueMagicLink(env, slug, email) {
 }
 
 /**
- * POST /sites/:slug/magic — email a one-time magic login link to `email` for an
- * EXISTING slug. Open to all: this only issues a login link and does NOT grant
- * access. The address must already be in the slug's email grant for the redeemed
- * token to actually be able to write. No Cloudflare provisioning or slug creation
- * happens here.
- */
-async function loginMagic(env, request, slug) {
-  if (!validateSlug(slug)) return Response.json({ error: 'invalid slug' }, { status: 400 });
-  if (!(await siteExists(env, slug))) {
-    return Response.json({ error: 'slug not found' }, { status: 404 });
-  }
-
-  const body = await readJsonBody(request);
-  if (!body.ok) return Response.json({ error: body.error }, { status: 400 });
-  const email = body.data.email;
-  if (!validateEmail(email)) {
-    return Response.json({ error: 'a valid email is required' }, { status: 400 });
-  }
-
-  const issued = await issueMagicLink(env, slug, email);
-  if (!issued.ok) {
-    return Response.json({ ok: false, error: issued.error }, { status: issued.status });
-  }
-  return Response.json({ ok: true, slug, sent: true, email }, { status: 200 });
-}
-
-/**
  * POST /auth/request — email a one-time magic login link to every slug the
- * `email` address already has edit access to. Open to all: like loginMagic it
- * only issues links and never grants access (authorize still checks the email
+ * `email` address already has edit access to. Open to all: it only issues links
+ * and never grants access (authorize still checks the email
  * grant after the code is redeemed). This is what lets the editor offer an
  * email-only login screen — the slug(s) are resolved here from the (encrypted)
  * email allowlist instead of being typed by the user.
@@ -1985,24 +2008,7 @@ async function listFiles(env, slug) {
   return Response.json({ slug, files });
 }
 
-// Read one file by token (editor-authed). Token is used verbatim as the key;
-// it is never decoded into a path.
-async function readFile(env, slug, token, request) {
-  const auth = await authorize(env, slug, request);
-  if (!auth.ok) return Response.json({ error: auth.error }, { status: auth.status });
-
-  const key = `${slug}/${token}`;
-  if (!key.startsWith(`${slug}/`)) {
-    return new Response('Invalid path', { status: 400 });
-  }
-  const obj = await env.CONTENT.get(key);
-  if (!obj) return new Response('Not Found', { status: 404 });
-  const headers = new Headers();
-  obj.writeHttpMetadata(headers); // content-type etc. stored on the object
-  return new Response(obj.body, { status: 200, headers });
-}
-
-// Write one file by token (editor-authed). Token is used verbatim as the key.
+// Write one file by token (admin or editor). Token is used verbatim as the key.
 async function putFile(ctx, env, slug, token, request) {
   const key = `${slug}/${token}`;
   if (!key.startsWith(`${slug}/`)) {
@@ -2015,9 +2021,23 @@ async function putFile(ctx, env, slug, token, request) {
   // (and any other living file) revalidates instead. Consumers that must stay fresh
   // already cache-bust with a ?_=/?time query param or cache:no-cache.
   const cacheControl = LIVING_FILES.has(token) ? CACHE_REVALIDATE : CACHE_IMMUTABLE;
-  await env.CONTENT.put(key, request.body, {
-    httpMetadata: { contentType, cacheControl },
-  });
+  // Reject oversized uploads up front (Content-Length) and on the live stream
+  // (a client can lie about the header). An oversized body answers 413, not 500.
+  const declared = Number(request.headers.get('Content-Length'));
+  if (!Number.isNaN(declared) && declared > MAX_FILE_BYTE) {
+    return Response.json({ ok: false, error: 'file too large' }, { status: 413 });
+  }
+  const body = request.body ? cappedBody(request.body, MAX_FILE_BYTE) : request.body;
+  try {
+    await env.CONTENT.put(key, body, {
+      httpMetadata: { contentType, cacheControl },
+    });
+  } catch (err) {
+    if (err instanceof Error && err.message === BODY_TOO_LARGE) {
+      return Response.json({ ok: false, error: 'file too large' }, { status: 413 });
+    }
+    throw err;
+  }
   // Auto-build: whenever a site's config.json is saved, trigger a page build
   // (best-effort, fire-and-forget via waitUntil so the save is never blocked or
   // failed by a dispatch problem).
@@ -2042,8 +2062,15 @@ async function patchConfigFile(ctx, env, slug, request) {
   }
   let body;
   try {
-    body = await request.json();
-  } catch {
+    const text = await request.text();
+    if (text.length > MAX_PATCH_BODY) {
+      return Response.json({ ok: false, error: 'request body too large' }, { status: 413 });
+    }
+    body = JSON.parse(text);
+  } catch (err) {
+    if (err instanceof Error && err.message === BODY_TOO_LARGE) {
+      return Response.json({ ok: false, error: 'request body too large' }, { status: 413 });
+    }
     return Response.json({ ok: false, error: 'Invalid JSON body' }, { status: 400 });
   }
   if (!Array.isArray(body?.ops) || body.ops.length === 0) {
@@ -2108,7 +2135,7 @@ async function backfillCache(env) {
   return Response.json({ ok: true, updated, skipped }, { status: 200 });
 }
 
-// Delete one file by token (editor-authed). Token is used verbatim as the key.
+// Delete one file by token (admin or editor). Token is used verbatim as the key.
 async function deleteFile(env, slug, token) {
   const key = `${slug}/${token}`;
   if (!key.startsWith(`${slug}/`)) {
