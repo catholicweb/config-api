@@ -673,23 +673,6 @@ async function readJsonBody(request) {
   }
 }
 
-// Wrap a streamed request body so it errors once it exceeds `max` bytes. The
-// request body is counted by the platform and capped independently, but capping
-// here too bounds how much the worker buffers/forwards even when a client lies
-// about Content-Length. Throws the BODY_TOO_LARGE marker so putFile can answer a
-// clean 413 instead of surfacing a generic 500.
-function cappedBody(stream, max) {
-  let size = 0;
-  const ts = new TransformStream({
-    transform(chunk, controller) {
-      size += chunk.length;
-      if (size > max) controller.error(new Error(BODY_TOO_LARGE));
-      else controller.enqueue(chunk);
-    },
-  });
-  return stream.pipeThrough(ts);
-}
-
 // ---------------------------------------------------------------------------
 // Auth — admin (site creation) and editor (file read/write)
 // ---------------------------------------------------------------------------
@@ -1136,16 +1119,12 @@ const CACHE_IMMUTABLE = 'public, max-age=31536000, immutable';
 const CACHE_REVALIDATE = 'public, max-age=0, must-revalidate';
 const LIVING_FILES = new Set(['config.json', 'slugs.json']);
 
-// Request-body size caps. Every endpoint reads caller-supplied bytes into memory
-// before use; uncapped bodies are a memory/CPU/cost abuse vector (the JSON paths
-// are parsed, so a giant body is CPU work too). Config/media are the large ones;
-// the small JSON control bodies cap tight. Content-Length may lie, so putFile also
-// enforces the cap on the live stream (see cappedBody). Marker distinguishes a
-// raised cap from any other stream failure so the handler can answer 413 cleanly.
+// Request-body size caps. JSON/patch bodies are read into memory before parsing
+// (a giant body is a memory/CPU abuse vector). The PUT path enforces a
+// Content-Length pre-check; the body itself is streamed straight into R2.
 const MAX_JSON_BODY = 1024 * 1024; // 1 MiB — auth/editors/clone/create JSON bodies
 const MAX_PATCH_BODY = 5 * 1024 * 1024; // 5 MiB — config.json patch op payloads
 const MAX_FILE_BYTE = 20 * 1024 * 1024; // 20 MiB — file content (PUT)
-const BODY_TOO_LARGE = 'parroquia:body-too-large';
 
 // Auto-build: where to dispatch the deploy workflow when a site's config.json is
 // written. The workflow (web-template/.github/workflows/deploy.yml) accepts a
@@ -2069,23 +2048,16 @@ async function putFile(ctx, env, slug, token, request) {
   // (and any other living file) revalidates instead. Consumers that must stay fresh
   // already cache-bust with a ?_=/?time query param or cache:no-cache.
   const cacheControl = LIVING_FILES.has(token) ? CACHE_REVALIDATE : CACHE_IMMUTABLE;
-  // Reject oversized uploads up front (Content-Length) and on the live stream
-  // (a client can lie about the header). An oversized body answers 413, not 500.
+  // Reject oversized uploads up front (Content-Length). The body is streamed
+  // straight into R2 — no wrapper (e.g. pipeThrough a TransformStream) because
+  // R2 requires a known-length stream and a TransformStream output isn't one.
   const declared = Number(request.headers.get('Content-Length'));
   if (!Number.isNaN(declared) && declared > MAX_FILE_BYTE) {
     return Response.json({ ok: false, error: 'file too large' }, { status: 413 });
   }
-  const body = request.body ? cappedBody(request.body, MAX_FILE_BYTE) : request.body;
-  try {
-    await env.CONTENT.put(key, body, {
-      httpMetadata: { contentType, cacheControl },
-    });
-  } catch (err) {
-    if (err instanceof Error && err.message === BODY_TOO_LARGE) {
-      return Response.json({ ok: false, error: 'file too large' }, { status: 413 });
-    }
-    throw err;
-  }
+  await env.CONTENT.put(key, request.body, {
+    httpMetadata: { contentType, cacheControl },
+  });
   // Auto-build: whenever a site's config.json is saved, trigger a page build
   // (best-effort, fire-and-forget via waitUntil so the save is never blocked or
   // failed by a dispatch problem).
@@ -2115,10 +2087,7 @@ async function patchConfigFile(ctx, env, slug, request) {
       return Response.json({ ok: false, error: 'request body too large' }, { status: 413 });
     }
     body = JSON.parse(text);
-  } catch (err) {
-    if (err instanceof Error && err.message === BODY_TOO_LARGE) {
-      return Response.json({ ok: false, error: 'request body too large' }, { status: 413 });
-    }
+  } catch {
     return Response.json({ ok: false, error: 'Invalid JSON body' }, { status: 400 });
   }
   if (!Array.isArray(body?.ops) || body.ops.length === 0) {
