@@ -1322,7 +1322,7 @@ async function createSite(ctx, env, slug, email) {
   const mres = await mutateState(env, (s) => addEmailGrant(s, normalizeEmail(email), slug));
   if (!mres.ok) return Response.json({ error: mres.error }, { status: 503 });
 
-  const issued = await issueMagicLink(env, slug, email);
+  const issued = await issueMagicLink(env, [slug], email);
   if (!issued.ok) {
     return Response.json({ ok: false, error: issued.error }, { status: issued.status });
   }
@@ -1658,17 +1658,19 @@ async function deleteSite(ctx, env, slug) {
 }
 
 /**
- * Mint a one-time magic code for `slug` and email the login link to `email`.
- * This ONLY issues a login link — it does NOT grant the address access. Whether
- * the redeemed token can write is decided later by `authorize` against the email
- * grant, which is seeded by `createSite` and added via `POST /sites/:slug/editors`.
- * Returns { ok:true } or { ok:false, status, error }.
+ * Mint a one-time magic code for every slug in `slugs` and email ONE aggregated
+ * login link to `email`. This ONLY issues a login link — it does NOT grant the
+ * address access. Whether the redeemed token can write is decided later by
+ * `authorize` against the email grant, which is seeded by `createSite` and added
+ * via `POST /sites/:slug/editors`. Returns { ok:true } or { ok:false, status, error }.
  *
  * The code is stored in the encrypted state (keyed by its SHA-256), is single-use,
- * and expires after MAGIC_TTL_MS. The email is sent first; only on success is the
- * code recorded, so a delivery failure leaves no stale pending code to roll back.
+ * and expires after MAGIC_TTL_MS. It is bound to `slugs[0]` (cosmetic — the
+ * redeemed token already covers every slug the email is granted on via the
+ * multisession roster). The email is sent first; only on success is the code
+ * recorded, so a delivery failure leaves no stale pending code to roll back.
  */
-async function issueMagicLink(env, slug, email) {
+async function issueMagicLink(env, slugs, email) {
   if (!env.RESEND_API_KEY) {
     return { ok: false, status: 503, error: 'magic-link email not configured (RESEND_API_KEY not set)' };
   }
@@ -1679,14 +1681,14 @@ async function issueMagicLink(env, slug, email) {
 
   // Send the email first, then record the code. A crash between the two leaves a
   // dead link rather than a stuck pending code; the caller is otherwise retryable.
-  const sent = await sendMagicLinkEmail(env, email, slug, code);
+  const sent = await sendMagicLinkEmail(env, email, slugs, code);
   if (!sent.ok) {
     return { ok: false, status: 502, error: `failed to send magic-link email: ${sent.error}` };
   }
 
   const state = await readAuthState(env);
   if (!state) return { ok: false, status: 503, error: 'auth state unavailable' };
-  state.magic[codeHash] = { slug, email: normalizeEmail(email), exp };
+  state.magic[codeHash] = { slug: slugs[0], email: normalizeEmail(email), exp };
   const res = await writeAuthState(env, state);
   if (!res.ok) return { ok: false, status: 503, error: res.error };
   return { ok: true };
@@ -1719,17 +1721,17 @@ async function requestMagicLink(env, request) {
     return Response.json({ error: 'a valid email is required' }, { status: 400 });
   }
 
-  // Look up the address's granted slugs from the decrypted state. One magic link
-  // per slug; issueMagicLink sends its own email and is best-effort per slug so
-  // a single failure doesn't block the rest.
+  // Look up the address's granted slugs from the decrypted state. One email
+  // listing every slug the address can edit; issueMagicLink mints a single code
+  // that (via the multisession roster) covers all of them.
   const state = await readAuthState(env);
   if (!state) return Response.json({ error: 'auth state unavailable' }, { status: 503 });
 
   const slugs = (state.emails[normalizeEmail(email)] || []).filter(Boolean);
-  for (const slug of slugs) {
-    const issued = await issueMagicLink(env, slug, email);
+  if (slugs.length > 0) {
+    const issued = await issueMagicLink(env, slugs, email);
     if (!issued.ok) {
-      console.error(`[auth/request] failed to email link for slug=${slug}: ${issued.error}`);
+      console.error(`[auth/request] failed to email links for ${slugs.join(',')}: ${issued.error}`);
     }
   }
 
@@ -1759,7 +1761,7 @@ async function addEditor(env, request, slug) {
   const mres = await mutateState(env, (s) => addEmailGrant(s, normalizeEmail(email), slug));
   if (!mres.ok) return Response.json({ error: mres.error }, { status: 503 });
 
-  const issued = await issueMagicLink(env, slug, email);
+  const issued = await issueMagicLink(env, [slug], email);
   if (!issued.ok) {
     return Response.json({ ok: false, error: issued.error }, { status: issued.status });
   }
@@ -1863,19 +1865,67 @@ async function updateEditor(env, request, slug) {
 /**
  * Send the magic-link email via Resend's JSON API. The link points at the
  * editor's magic-link landing page (MAGIC_LINK_BASE, default
- * https://editor.parroquia.app/magic), carrying the slug for display and the
- * one-time code. Returns { ok:true } or { ok:false, error }.
+ * https://editor.parroquia.app/magic), carrying the first slug for display and
+ * the one-time code. Returns { ok:true } or { ok:false, error }.
+ *
+ * Sends both a plain-text and an HTML body (multipart) in Spanish.
  */
-async function sendMagicLinkEmail(env, email, slug, code) {
+async function sendMagicLinkEmail(env, email, slugs, code) {
   const apiKey = env.RESEND_API_KEY;
   if (!apiKey) return { ok: false, error: 'RESEND_API_KEY not configured' };
 
   const from = env.FROM_EMAIL || 'no-reply@parroquia.app';
   const base = (env.MAGIC_LINK_BASE || 'https://editor.parroquia.app/magic').replace(/\/$/, '');
-  const link = `${base}?slug=${encodeURIComponent(slug)}&code=${encodeURIComponent(code)}`;
+  const link = `${base}?slug=${encodeURIComponent(slugs[0])}&code=${encodeURIComponent(code)}`;
+
+  const slugList = slugs.length === 1 ? slugs[0] : `${slugs.length} sitios`;
+  const subject = slugs.length === 1
+    ? `Tu enlace de acceso a ${slugs[0]}`
+    : 'Tus enlaces de acceso a Parroquia';
 
   // Worker logs are not public — this makes the code clickable during local dev.
-  console.log(`[magic-link] slug=${slug} to=${email} link=${link}`);
+  console.log(`[magic-link] slugs=${slugs.join(',')} to=${email} link=${link}`);
+
+  // Plain-text body: list all slugs, one per line.
+  const textSlugs = slugs.map((s) => `  • ${s}`).join('\n');
+  const text = `¡Hola! Qué alegría tener tu parroquia en internet.\n\n`
+    + `Tu${slugs.length === 1 ? ' sitio' : 's sitios'}:\n${textSlugs}\n\n`
+    + `Pulsa este enlace para entrar en el editor (válido durante unos minutos y de un solo uso):\n\n${link}\n\n`
+    + `Si no solicitaste este enlace puedes ignorar este correo.`;
+
+  // HTML body: warm, brief, welcoming. Inline CSS only (email-safe).
+  const htmlSlugs = slugs.map((s) => `<li style="margin:4px 0;color:#444;font-size:16px;">${s}</li>`).join('\n');
+  const html = `<!DOCTYPE html>
+<html lang="es">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${subject}</title>
+</head>
+<body style="margin:0;padding:0;background:#f5f5f5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f5f5f5;"><tr><td align="center">
+    <table width="600" cellpadding="0" cellspacing="0" style="background:#fff;border-radius:8px;margin:24px 16px;padding:32px 24px;">
+      <tr><td>
+        <h1 style="margin:0 0 16px;color:#1a1a1a;font-size:22px;">¡Bienvenido/a a Parroquia! 🎉</h1>
+        <p style="margin:0 0 16px;color:#444;font-size:16px;line-height:1.5;">
+          Qué alegría tener tu parroquia en internet. Ya puedes entrar en el editor para gestionar tu sitio web.
+        </p>
+        <p style="margin:0 0 12px;color:#444;font-size:16px;line-height:1.5;">
+          <strong>Tu${slugs.length === 1 ? ' sitio' : 's sitios'}:</strong>
+        </p>
+        <ul style="margin:0 0 24px;padding-left:20px;">${htmlSlugs}</ul>
+        <p style="margin:0 0 24px;color:#444;font-size:16px;line-height:1.5;">
+          Pulsa el botón para entrar (enlace de un solo uso, válido unos minutos):
+        </p>
+        <table cellpadding="0" cellspacing="0"><tr><td style="background:#0066cc;border-radius:6px;">
+          <a href="${link}" style="display:inline-block;padding:12px 24px;color:#fff;text-decoration:none;font-size:16px;font-weight:bold;">Entrar en el editor</a>
+        </td></tr></table>
+        <p style="margin:24px 0 0;color:#888;font-size:13px;">
+          Si no solicitaste este enlace, puedes ignorar este correo.
+        </p>
+      </td></tr>
+    </table>
+  </td></tr></table>
+</body>
+</html>`;
 
   try {
     const res = await fetch('https://api.resend.com/emails', {
@@ -1887,8 +1937,9 @@ async function sendMagicLinkEmail(env, email, slug, code) {
       body: JSON.stringify({
         from,
         to: email,
-        subject: `Tu enlace de acceso a ${slug}`,
-        text: `Pulsa este enlace para entrar en el editor de ${slug} (válido durante unos minutos y de un solo uso):\n\n${link}`,
+        subject,
+        text,
+        html,
       }),
     });
     if (!res.ok) {
