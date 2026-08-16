@@ -1,33 +1,25 @@
 #!/usr/bin/env node
 /**
- * One-shot migration script to rename the item-identity key from `uuid`/`name`
- * to `id` in existing server config.json files.
+ * Generic config.json replacer runner.
  *
- * Background: the editor used to inject a hidden `uuid` field into every
- * repeatable object / block variant, and some schema components declared the
- * ident inline as `name` (double-key bug — items got both keys). The new
- * convention unifies under the key `id`.
+ * Reads the list of site slugs from the public data origin
+ * (https://data.parroquia.app/slugs.json) and applies a user-supplied
+ * `replacer` function to each site's config.json, then writes back
+ * via the admin-gated API.
  *
- * Algorithm:
- *   For every plain object encountered (recursive walk of arrays and objects):
- *     1. If `name` matches a valid UUID string → `id = name; delete name`.
- *        (A human-typed name is never a valid UUID, so this rule distinguishes
- *         uuid-idents from plain string names.)
- *     2. If `uuid` still exists → `id = uuid` (only if `id` not already set
- *        from step 1); then `delete uuid`.
- *     3. Recurse into every value.
- *
- * Idempotent: any config already using `id` is unchanged.
+ * The replacer function takes the raw config.json file text as input and
+ * returns the new file text. Edit it to perform your replacement
+ * (e.g. a replaceAll on the raw string).
  *
  * Env:
- *   PARROQUIA_ADMIN_TOKEN  (required — admin token matching ADMIN_TOKEN_HASH)
+ *   PARROQUIA_ADMIN_TOKEN  (required — admin token for PUT writes)
  *   CONFIG_API_BASE        (default https://api.parroquia.app)
  *   PARROQUIA_DATA_BASE    (default https://data.parroquia.app)
  *
  * Usage:
  *   PARROQUIA_ADMIN_TOKEN=xxx node migrate-uuid-to-id.mjs [--dry-run] [slug …]
  *     --dry-run   Print the per-slug report without writing anything
- *     slug …      Optional slugs to target (default: all from GET /sites)
+ *     slug …      Optional slugs to target (default: all from slugs.json)
  */
 
 const ADMIN_TOKEN = process.env.PARROQUIA_ADMIN_TOKEN?.trim();
@@ -39,8 +31,6 @@ if (!ADMIN_TOKEN) {
 const API_BASE = (process.env.CONFIG_API_BASE || "https://api.parroquia.app").replace(/\/+$/, "");
 const DATA_BASE = (process.env.PARROQUIA_DATA_BASE || "https://data.parroquia.app").replace(/\/+$/, "");
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
 // Flag to only show diffs without writing (parsed after slug args)
 let DRY_RUN = false;
 const args = process.argv.slice(2).filter((a) => {
@@ -51,52 +41,11 @@ const targetSlugs = args; // empty = all
 
 // ---- helpers ---------------------------------------------------------------
 
-function isPlainObject(x) {
-  return x !== null && typeof x === "object" && !Array.isArray(x);
-}
-
-function isUuidString(s) {
-  return typeof s === "string" && UUID_RE.test(s);
-}
-
-/**
- * Recursively walk `obj` and rename `name`/`uuid` → `id` where applicable.
- * Returns `true` if any change was made.
- */
-function migrateObj(obj) {
-  if (!isPlainObject(obj)) return false;
-  let changed = false;
-
-  // Step 1: `name` that is a valid UUID → `id` wins
-  if (Object.prototype.hasOwnProperty.call(obj, "name") && isUuidString(obj.name)) {
-    obj.id = obj.name;
-    delete obj.name;
-    changed = true;
-  }
-
-  // Step 2: `uuid` → `id` (if not already set by step 1)
-  if (Object.prototype.hasOwnProperty.call(obj, "uuid")) {
-    if (!Object.prototype.hasOwnProperty.call(obj, "id")) {
-      obj.id = obj.uuid;
-    }
-    delete obj.uuid;
-    changed = true;
-  }
-
-  // Step 3: Recurse into every value
-  for (const key of Object.keys(obj)) {
-    const val = obj[key];
-    if (isPlainObject(val)) {
-      if (migrateObj(val)) changed = true;
-    } else if (Array.isArray(val)) {
-      for (const item of val) {
-        if (migrateObj(item)) changed = true;
-      }
-    }
-  }
-
-  return changed;
-}
+// ==== REPLACER ================================================================
+// Transform the config.json file text -> new config.json file text.
+// Edit this to perform your replacement (e.g. a replaceAll on the raw string).
+const replacer = (configText) => configText;
+// ============================================================================
 
 async function fetchJson(url, opts) {
   const res = await fetch(url, opts);
@@ -118,17 +67,15 @@ async function main() {
     slugs = targetSlugs;
     console.log(`Targeting ${slugs.length} slug(s) from CLI args.`);
   } else {
-    console.log("Fetching site list from API…");
-    const sitesRes = await fetchJson(`${API_BASE}/sites`, {
-      headers: { Authorization: `Bearer ${ADMIN_TOKEN}` },
+    console.log("Fetching slug list from data origin…");
+    const slugsRes = await fetchJson(`${DATA_BASE}/slugs.json`, {
+      headers: { "Cache-Control": "no-cache, no-store, must-revalidate" },
     });
-    if (!sitesRes.ok) {
-      console.error(`Failed to list sites: ${sitesRes.status} — ${sitesRes.raw.slice(0, 200)}`);
+    if (!slugsRes.ok || !Array.isArray(slugsRes.json?.slugs)) {
+      console.error(`Failed to read slugs from ${DATA_BASE}/slugs.json (HTTP ${slugsRes.status})`);
       process.exit(1);
     }
-    slugs = (sitesRes.json?.sites || [])
-      .map((s) => (typeof s === "string" ? s : s.slug))
-      .filter(Boolean);
+    slugs = slugsRes.json.slugs.filter((s) => typeof s === "string");
     console.log(`Found ${slugs.length} site(s).`);
   }
 
@@ -158,23 +105,27 @@ async function main() {
       continue;
     }
 
-    const config = configRes.json;
-    if (!config) {
-      console.log("empty or invalid JSON — skip");
+    const raw = configRes.raw;
+    if (!raw.trim()) {
+      console.log("empty config.json — skip");
       skipped++;
       continue;
     }
 
-    // Apply the migration
-    const changed = migrateObj(config);
-    if (!changed) {
+    // Apply the replacer
+    const newBody = replacer(raw);
+    if (typeof newBody !== "string") {
+      console.log("replacer did not return a string — skip");
+      errors.push({ slug, error: "replacer did not return a string" });
+      continue;
+    }
+
+    if (newBody === raw) {
       console.log("unchanged — skip");
       skipped++;
       continue;
     }
 
-    // Format the result (2-space indent, trailing newline)
-    const newBody = JSON.stringify(config, null, 2) + "\n";
     const sizeKB = (newBody.length / 1024).toFixed(1);
 
     if (DRY_RUN) {
@@ -183,7 +134,7 @@ async function main() {
       continue;
     }
 
-    // PUT the migrated config back
+    // PUT the replaced config back
     const putRes = await fetchJson(`${API_BASE}/sites/${slug}/config.json`, {
       method: "PUT",
       headers: {
