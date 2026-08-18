@@ -59,9 +59,13 @@ function genUuid() {
 }
 
 // An array is KEYED when every item is a plain object with a non-empty string
-// `id`. Empty arrays are vacuously keyed. Anything else is keyless.
+// `id`. Empty arrays are NOT keyed (treated as keyless) so a scalar list that
+// starts empty and gains plain values (e.g. [] -> ["a","b"]) diffs as a
+// wholesale `set` instead of wrapping each scalar into { id, value }. A
+// genuinely keyed array paired with an empty one still routes to diffKeyedArray,
+// because at least one side then has real id-bearing items.
 export function isKeyedArray(arr) {
-  if (!Array.isArray(arr)) return false;
+  if (!Array.isArray(arr) || arr.length === 0) return false;
   for (const item of arr) {
     if (!isPlainObject(item) || typeof item[ID_KEY] !== 'string' || item[ID_KEY].length === 0) {
       return false;

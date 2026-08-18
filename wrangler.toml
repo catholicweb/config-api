@@ -48,6 +48,15 @@ workers_dev = false
 #                                                   # on catholicweb/web-template ONLY (least privilege).
 #                                                   # A classic PAT with broad repo scope is NOT recommended.
 #
+# Secrets required for FCM (subscribe + send):
+#
+#   npx wrangler secret put FCM_SERVER_KEY          # Firebase Cloud Messaging server key
+#                                                   # (from Firebase Console → Project Settings → Cloud Messaging).
+#                                                   # Used by POST /api/fcm/token to subscribe browser
+#                                                   # registration tokens to per-site FCM topics, AND by the
+#                                                   # daily cron (src/notifications.js) to send topic
+#                                                   # messages for tomorrow's calendar events.
+#
 # For local dev, put them in .dev.vars instead (gitignored).
 
 # Non-secret: where the emailed magic link points (the editor magic-link landing
@@ -68,3 +77,10 @@ bucket_name = "parroquia"
 [observability.logs]
 enabled = true
 invocation_logs = true
+
+# Daily cron: send FCM topic notifications for tomorrow's calendar events.
+# Runs at 19:00 UTC (= 20:00 CET winter / 21:00 CEST summer). At this hour
+# "tomorrow" is the same date in both UTC and Europe/Madrid, avoiding
+# timezone-boundary edge cases in the date comparison.
+[[triggers]]
+crons = ["0 19 * * *"]

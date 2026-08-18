@@ -24,6 +24,7 @@
 // (could be regarded as a part of the same inter-dependency contract):
 // applyPatch applies the editor's diff ops onto the stored doc.
 import { applyPatch } from './patch.js';
+import { scheduled as sendNotificationsCron } from './notifications.js';
 
 /**
  * parroquia-config-api
@@ -82,6 +83,16 @@ import { applyPatch } from './patch.js';
  *                                       encrypted email allowlist, so the editor can offer an
  *                                       email-only login). Body: { "email": "<addr>" }. Never
  *                                       grants access; returns a generic success either way.
+ *
+ * FCM TOKEN SUBSCRIPTION (no auth — open to all):
+ *   POST /api/fcm/token              — receive an FCM registration token from the browser and
+ *                                       subscribe it to the site's FCM topic. Body:
+ *                                       { "token": "<fcm-token>", "site": "<slug>" }. Calls the
+ *                                       FCM legacy IID subscribe API (iid.googleapis.com) with
+ *                                       env.FCM_SERVER_KEY (Worker secret). The browser can't
+ *                                       subscribe tokens to topics itself — see
+ *                                       firebase/firebase-js-sdk#5289. The call is fire-and-forget
+ *                                       via ctx.waitUntil(); subscribes are idempotent.
  *
  * WRITE (admin OR editor bearer token required):
  *   PUT    /sites/:slug/:filename   — overwrite a file (filename = validated human-readable name)
@@ -180,6 +191,16 @@ export default {
 
     if (segments.length === 1 && segments[0] === 'whoami' && method === 'GET') {
       return whoami(env, request);
+    }
+
+    // POST /api/fcm/token — receive an FCM device token from the browser and
+    // subscribe it to the site's FCM topic (topic = SITE_SLUG). The browser
+    // cannot subscribe tokens to topics itself (firebase/firebase-js-sdk#5289),
+    // so this endpoint bridges browser → FCM subscribe HTTP API using
+    // FCM_SERVER_KEY (a Worker secret). Open to all: the token+site come from
+    // the browser, which cannot forge a subscription it doesn't hold.
+    if (method === 'POST' && segments.length === 3 && segments[0] === 'api' && segments[1] === 'fcm' && segments[2] === 'token') {
+      return subscribeFcmToken(ctx, env, request);
     }
 
     // POST /auth/magic — exchange a one-time magic code (from the emailed link)
@@ -380,6 +401,10 @@ export default {
       console.error('unhandled worker error:', err);
       return Response.json({ error: 'internal error' }, { status: 500 });
     }
+  },
+  async scheduled(controller, env, ctx) {
+    console.log("scheduled: running daily notification cron");
+    await sendNotificationsCron(env, ctx);
   },
 };
 
@@ -1853,7 +1878,7 @@ async function sendMagicLinkEmail(env, email, slugs, code) {
   const apiKey = env.RESEND_API_KEY;
   if (!apiKey) return { ok: false, error: 'RESEND_API_KEY not configured' };
 
-  const from = env.FROM_EMAIL || 'no-reply@parroquia.app';
+  const from = env.FROM_EMAIL || 'Parroquia App - Bienvenida <no-reply@parroquia.app>';
   const base = (env.MAGIC_LINK_BASE || 'https://editor.parroquia.app/magic').replace(/\/$/, '');
   const link = `${base}?slug=${encodeURIComponent(slugs[0])}&code=${encodeURIComponent(code)}`;
 
@@ -1992,6 +2017,59 @@ async function exchangeMagic(env, request) {
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
+
+/**
+ * POST /api/fcm/token — receive an FCM registration token from the browser
+ * and subscribe it to the site's FCM topic. Topic subscription requires the
+ * Firebase server key, which must never reach the browser (the Web SDK has no
+ * client-side subscribeToTopic — see firebase/firebase-js-sdk#5289). This Worker
+ * (a Cloudflare Worker, no Node.js / firebase-admin) calls the FCM legacy IID
+ * HTTP API directly with the server key via fetch().
+ *
+ * The FCM IID subscribe endpoint (https://iid.googleapis.com/iid/v1/{token}/rel/topics/{topic})
+ * is idempotent: re-subscribing an already-subscribed token is a no-op, so the
+ * browser can POST on every page load without harm.
+ *
+ * ctx.waitUntil() makes the FCM call fire-and-forget so the Worker responds
+ * immediately with { ok: true } and the client is never blocked by the
+ * downstream FCM call latency.
+ *
+ * Requires env.FCM_SERVER_KEY (Worker secret). Returns { ok:true } even if the
+ * key is missing; the subscription simply doesn't happen. Failures are logged.
+ */
+async function subscribeFcmToken(ctx, env, request) {
+  const body = await readJsonBody(request);
+  if (!body.ok) return Response.json({ error: body.error }, { status: 400 });
+
+  const { token, site } = body.data;
+  if (typeof token !== 'string' || !token) {
+    return Response.json({ error: 'token is required' }, { status: 400 });
+  }
+  if (typeof site !== 'string' || !site) {
+    return Response.json({ error: 'site is required' }, { status: 400 });
+  }
+
+  const serverKey = env.FCM_SERVER_KEY;
+  if (!serverKey) {
+    console.log('subscribeFcmToken: FCM_SERVER_KEY not configured; skipping subscription');
+    return Response.json({ ok: true }, { status: 200 });
+  }
+
+  // Use ctx.waitUntil so the Worker responds immediately and the FCM call
+  // doesn't block the client. The subscribe is idempotent.
+  if (ctx?.waitUntil) {
+    ctx.waitUntil(
+      fetch(`https://iid.googleapis.com/iid/v1/${encodeURIComponent(token)}/rel/topics/${encodeURIComponent(site)}`, {
+        method: 'POST',
+        headers: { 'Authorization': `key=${serverKey}` },
+      }).catch((e) => {
+        console.error('FCM subscribe failed:', e);
+      }),
+    );
+  }
+
+  return Response.json({ ok: true }, { status: 200 });
+}
 
 async function handleHealth(env) {
   const entry = { bound: !!env.CONTENT, responds: false };

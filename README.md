@@ -53,6 +53,7 @@ the code ever disagree, **the code wins** and this README must be corrected.
 | POST   | `/sites/backfill-cache`  | `Bearer admin`  | — maintenance: re-stamp `Cache-Control` metadata onto every existing bucket object so `data.parroquia.app` caches them (idempotent) | `200 { ok, updated, skipped }` / `401/403/503` |
 | POST   | `/sites/:slug/clone`    | `Bearer admin`  | body `{ "targetSlug": "<slug>" }` — clone all content (files, email grants, config.json media URL rewriting) from an existing slug to a new slug; provisions Cloudflare for the target; does not modify the source | `201 { ok, sourceSlug, targetSlug, filesCopied, domainStatus }` / `400/401/403/404/409/502/503` |
 | DELETE | `/sites/:slug`          | `Bearer admin`  | — delete a site entirely: best-effort Cloudflare resource cleanup, then remove all R2 content, clean up auth.enc grants/tokens/magic, re-scan slugs.json | `200 { ok, slug, filesDeleted, cfWarnings? }` / `400/401/403/404/503` |
+| POST   | `/api/fcm/token`       | —               | body `{ "token": "<fcm-token>", "site": "<slug>" }` — subscribe the FCM registration token to the site's topic (topic = `site`). Open to all. Uses `FCM_SERVER_KEY` Worker secret, which is also used by the [daily cron](#fcm-notifications) to send topic messages for tomorrow's calendar events. | `200 { ok: true }` / `400` |
 | PUT    | `/sites/:slug/:token`    | `Bearer editor | admin` | body = raw bytes, `Content-Type` optional. Writing `config.json` also triggers an automatic page build (best-effort, see [Auto-build](#auto-build)) | `200 { ok, slug, key }` / `400/401/403` |
 | PATCH  | `/sites/:slug/config.json` | `Bearer editor` | body `{ "ops": [...] }` — apply a small **diff** onto the currently stored `config.json` and return the merged doc (used by the editor for small, per-field, last-edit-wins concurrent saves; see [Patch saves](#patch-saves)). Also triggers an automatic page build | `200 { ok, slug, key, data, skipped }` / `400/401/403/404/500` |
 | DELETE | `/sites/:slug/:token`    | `Bearer editor | admin` | —                                                  | `200 { ok, slug, key }` / `400/401/403` |
@@ -151,7 +152,32 @@ curl -X DELETE -H "Authorization: Bearer <ADMIN_TOKEN>" \
 
 # Read a file (public, no auth) — from the data host, not the Worker
 curl https://data.parroquia.app/<slug>/noticias.md
+
+# Subscribe an FCM token to a site's topic (called by the browser via PWA.vue;
+# the browser can't subscribe tokens to topics itself — see firebase/firebase-js-sdk#5289)
+curl -X POST https://api.parroquia.app/api/fcm/token \
+  -H "Content-Type: application/json" \
+  --data '{"token":"<FCM_REGISTRATION_TOKEN>","site":"<slug>"}'
 ```
+
+#### FCM Notifications
+
+In addition to token subscription, `FCM_SERVER_KEY` powers a **daily cron** that
+sends push notifications for tomorrow's calendar events to each site's FCM
+topic (`/topics/<slug>`). The cron runs at **19:00 UTC** (see `[[triggers]]` in
+`wrangler.toml`) and works as follows:
+
+1. Reads `slugs.json` from R2 to get the list of all deployed site slugs.
+2. For each slug, fetches the already-processed `calendar.json` from the deployed
+   Pages site at `https://{slug}.parroquia.app/calendar.json?time={now}` (the
+   `?time=` cache-buster bypasses Cloudflare CDN for freshness).
+3. Filters events where `applyComplexFilter(event, "byday:empty") && isTomorrow(event.dates[0])`.
+4. Groups the filtered events by `["title", "times", "locations", "images"]` using
+   the shared `groupEvents()` utility (copied from web-template's
+   `docs/.vitepress/utils.js` into `src/utils.js`).
+5. Sends an FCM HTTP API message to `to: "/topics/<slug>"` per event group, with
+   the notification title, body, icon, and a `fcm_options.link` pointing to the
+   site so the user lands on the right page when they tap the notification.
 
 ### Slug renaming
 
@@ -467,7 +493,12 @@ Required secrets (set via `wrangler secret put`): `ADMIN_TOKEN_HASH`,
 `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_ZONE_ID`,
 `RESEND_API_KEY` (email delivery), `FROM_EMAIL` (verified sender; defaults to
 `no-reply@parroquia.app`), `AUTH_KEY` (base64 of 32 random bytes — the AES-256-GCM
-key that encrypts/decrypts `auth.enc`; generate with `openssl rand -base64 32`).
+key that encrypts/decrypts `auth.enc`; generate with `openssl rand -base64 32`),
+and `FCM_SERVER_KEY` (Firebase Cloud Messaging server key — used both by
+`POST /api/fcm/token` to subscribe browser tokens to per-site topics AND by the
+daily cron (`src/notifications.js`, see [FCM Notifications](#fcm-notifications))
+to send topic messages for tomorrow's calendar events to each site's
+`/topics/<slug>` topic).
 
 **Optional** secret: `GITHUB_BUILD_TOKEN` — a fine-grained PAT, scoped to ONLY
 `catholicweb/web-template` with `Actions: read and write` (classic PATs need broad
