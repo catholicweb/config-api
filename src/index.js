@@ -33,7 +33,7 @@ import { scheduled as sendNotificationsCron } from './notifications.js';
  *
  *   auth.enc                 — ALL credential state in one AES-GCM-256 encrypted blob
  *                              ({ emails, tokens, magic }; encrypted under AUTH_KEY)
- *   <slug>/.site             — per-slug existence marker (created on site creation)
+ *   <slug>/config.json       — site config (also the existence marker)
  *   <slug>/<filename>        — a file, where <filename> is a validated human-readable name
  *
  * File keys are validated filenames (not opaque tokens). The client encodes local
@@ -1127,7 +1127,7 @@ async function deleteCustomDomain(env, slug) {
 // /sites/list (which is R2-prefix based) even before any content is written.
 // It contains a `.` so it is outside the token charset and therefore can never
 // be written or overwritten by a client (clients can only write tokens).
-export const SITE_MARKER = '.site';
+// (No .site marker — config.json is the site existence marker.)
 
 // Lifespan of a pending magic link (one-time code) before it expires and can no
 // longer be exchanged for an editor token.
@@ -1210,11 +1210,9 @@ async function updateSlugsJson(env, { add, remove } = {}) {
 }
 
 async function siteExists(env, slug) {
-  // .site markers are created on every site creation and clone, so the marker
-  // head is authoritative and one R2 op (no list fallback). An old pre-marker
-  // slug would read as absent here; the marker has existed for every site
-  // created through this worker.
-  return !!(await env.CONTENT.head(`${slug}/${SITE_MARKER}`));
+  // Use config.json as the site existence marker (always present for a valid
+  // site, and the site is broken without it). One R2 head op.
+  return !!(await env.CONTENT.head(`${slug}/config.json`));
 }
 
 /**
@@ -1336,9 +1334,8 @@ async function createSite(ctx, env, slug, email) {
     return Response.json({ ok: false, error: issued.error }, { status: issued.status });
   }
 
-  await env.CONTENT.put(`${slug}/${SITE_MARKER}`, '{"ok":true}', {
-    httpMetadata: { contentType: 'application/json', cacheControl: CACHE_REVALIDATE },
-  });
+  // Site marker (.site) removed; config.json is the existence marker.
+  // (No extra write needed — config.json is written by putFile / createSite.)
 
   // Write the authoritative slugs.json at the bucket root (same shape as the
   // GET /sites/list response). We re-scan the bucket so the file is always
@@ -1569,10 +1566,8 @@ async function cloneSite(ctx, env, sourceSlug, request) {
     );
   }
 
-  // 7. Write .site marker for targetSlug
-  await env.CONTENT.put(`${targetSlug}/${SITE_MARKER}`, '{"ok":true}', {
-    httpMetadata: { contentType: 'application/json', cacheControl: CACHE_REVALIDATE },
-  });
+  // .site marker removed; config.json is the existence marker.
+  // (No extra write needed.)
 
   // 8. Dispatch build for targetSlug (fire-and-forget)
   if (ctx?.waitUntil) {
@@ -2100,8 +2095,8 @@ async function listSlugs(env) {
 }
 
 // Returns the list of file URLs under a slug: one absolute public URL per file
-// (https://data.parroquia.app/<slug>/<token>). The internal .site marker is
-// skipped. Consumers treat these as opaque absolute URLs — no token decoding.
+// (https://data.parroquia.app/<slug>/<token>). The site's config.json is
+// excluded from the public file list. Consumers treat these as opaque absolute URLs.
 async function listFiles(env, slug) {
   const prefix = `${slug}/`;
   const files = [];
@@ -2110,7 +2105,9 @@ async function listFiles(env, slug) {
     const listed = await env.CONTENT.list({ limit: 1000, cursor, prefix });
     for (const o of listed.objects) {
       const token = o.key.slice(prefix.length); // strip "<slug>/"
-      if (token === SITE_MARKER) continue; // internal marker
+      // .site marker removed; config.json is treated as the site's config file
+      // (not listed as a public file), but if it appears here skip it.
+      if (token === 'config.json') continue; // config file, not public content
       files.push(fileUrl(env, slug, token));
     }
     cursor = listed.truncated ? listed.cursor : undefined;
