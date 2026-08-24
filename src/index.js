@@ -419,15 +419,15 @@ export default {
 // hostnames cannot contain `_`, so only lowercase alnum + internal hyphens are
 // allowed (no leading/trailing hyphen, 1-63 chars). This is a strict subset of the
 // deploy workflow's slug check and prevents URL-equivalent subdomain collisions.
-const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+export const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
 // Slugs that must not be used as site names because they conflict with
 // existing DNS records or planned service endpoints under parroquia.app.
-const RESERVED_SLUGS = new Set(['api', 'editor', 'www', 'data']);
+export const RESERVED_SLUGS = new Set(['api', 'editor', 'www', 'data']);
 
 // Allowed file extensions for uploaded content. Only these extensions are
 // permitted after the single trailing dot in a filename.
-const ALLOWED_EXT = ['md', 'jpg', 'jpeg', 'png', 'gif', 'webp', 'pdf', 'json'];
+export const ALLOWED_EXT = ['md', 'jpg', 'jpeg', 'png', 'gif', 'webp', 'pdf', 'json'];
 
 // Filename validation: a URL-safe base name, plus one optional allowlisted
 // extension. The base charset [A-Za-z0-9_-] is used for backward compatibility
@@ -435,9 +435,9 @@ const ALLOWED_EXT = ['md', 'jpg', 'jpeg', 'png', 'gif', 'webp', 'pdf', 'json'];
 // separator.
 // This makes path traversal (..), hidden files (.env), and extension spoofing
 // (file.jpg.exe) structurally impossible.
-const FILENAME_RE = /^[A-Za-z0-9_-]+(\.[a-z0-9]{1,5})?$/;
+export const FILENAME_RE = /^[A-Za-z0-9_-]+(\.[a-z0-9]{1,5})?$/;
 
-function validateFilename(filename) {
+export function validateFilename(filename) {
   if (!filename || typeof filename !== 'string') return false;
   if (filename.length > 255) return false;          // filesystem limit
   if (filename.startsWith('-')) return false;        // CLI arg injection guard
@@ -452,15 +452,15 @@ function validateFilename(filename) {
   return true;
 }
 
-function validateSlug(slug) {
+export function validateSlug(slug) {
   return typeof slug === 'string' && SLUG_RE.test(slug);
 }
 
-function validateToken(token) {
+export function validateToken(token) {
   return validateFilename(token);
 }
 
-function validateSlugNotReserved(slug) {
+export function validateSlugNotReserved(slug) {
   return !RESERVED_SLUGS.has(slug);
 }
 
@@ -480,13 +480,13 @@ function fileUrl(env, slug, token) {
 
 // A minimal, intentionally permissive email shape check. The address is only
 // used to deliver a magic link; exact spec-compliance is the mail provider's job.
-function validateEmail(email) {
+export function validateEmail(email) {
   return typeof email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
 
 // Canonical form used as the state.emails key (trim + lowercase) so the same
 // address always maps to one entry regardless of case/whitespace.
-function normalizeEmail(email) {
+export function normalizeEmail(email) {
   return email.trim().toLowerCase();
 }
 
@@ -494,7 +494,7 @@ function normalizeEmail(email) {
 // Crypto helpers
 // ---------------------------------------------------------------------------
 
-async function sha256Hex(text) {
+export async function sha256Hex(text) {
   const data = new TextEncoder().encode(text);
   const digest = await crypto.subtle.digest('SHA-256', data);
   const bytes = new Uint8Array(digest);
@@ -506,31 +506,31 @@ async function sha256Hex(text) {
 // Base64 codecs for binary <-> string. Workers exposes global btoa/atob, which
 // operate on binary strings, so wrap Uint8Array. Enough for the 12-byte IV and
 // the small ciphertexts produced by AES-GCM here; no chunking needed.
-function bytesToBase64(bytes) {
+export function bytesToBase64(bytes) {
   let s = '';
   for (const b of bytes) s += String.fromCharCode(b);
   return btoa(s);
 }
 
-function base64ToBytes(b64) {
+export function base64ToBytes(b64) {
   const s = atob(b64);
   const bytes = new Uint8Array(s.length);
   for (let i = 0; i < s.length; i++) bytes[i] = s.charCodeAt(i);
   return bytes;
 }
 
-function toHex(bytes) {
+export function toHex(bytes) {
   let hex = '';
   for (const b of bytes) hex += b.toString(16).padStart(2, '0');
   return hex;
 }
 
 // Generate a 256-bit random editor token as 64 hex chars.
-function generateToken() {
+export function generateToken() {
   return toHex(crypto.getRandomValues(new Uint8Array(32)));
 }
 
-function timingSafeEqual(a, b) {
+export function timingSafeEqual(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string') return false;
   if (a.length !== b.length) return false;
   let mismatch = 0;
@@ -540,7 +540,7 @@ function timingSafeEqual(a, b) {
   return mismatch === 0;
 }
 
-function bearerToken(request) {
+export function bearerToken(request) {
   const h =
     request.headers.get('Authorization') ||
     request.headers.get('authorization');
@@ -568,7 +568,7 @@ function bearerToken(request) {
 // not base64, or not exactly 32 bytes. Never throws — an invalid value is
 // treated the same as a missing one so a bad secret degrades to a clean 503
 // instead of a raw Worker throw (Cloudflare error 1101).
-async function authKey(env) {
+export async function authKey(env) {
   if (!env.AUTH_KEY) return null;
   let raw;
   try {
@@ -590,7 +590,7 @@ async function authKey(env) {
 // on every call — reusing an IV across encrypts under the same AES-GCM key leaks
 // the key stream, so never cache/reuse an IV. Returns null (never throws) if
 // AUTH_KEY is missing or invalid.
-async function encryptState(env, state) {
+export async function encryptState(env, state) {
   const key = await authKey(env);
   if (!key) return null;
   const iv = crypto.getRandomValues(new Uint8Array(12));
@@ -602,7 +602,7 @@ async function encryptState(env, state) {
 
 // Decrypt an auth.enc blob. Returns the state object, or null on any failure
 // (wrong key, tamper, wrong version, bad shape).
-async function decryptState(env, blob) {
+export async function decryptState(env, blob) {
   try {
     const key = await authKey(env);
     if (!key || !blob || blob.v !== AUTH_STATE_V) return null;
@@ -624,7 +624,7 @@ async function decryptState(env, blob) {
 // decrypted (AUTH_KEY wrong/corrupt). A missing auth.enc (fresh store) reads as
 // a virgin empty state — no AUTH_KEY or migration is needed to read an absent
 // blob; auth.enc is created lazily on the first write.
-async function readAuthState(env) {
+export async function readAuthState(env) {
   const obj = await env.CONTENT.get(AUTH_FILE);
   if (!obj) return { emails: {}, tokens: {}, magic: {} }; // virgin state
   let blob;
@@ -644,7 +644,7 @@ async function readAuthState(env) {
 //     token is unreachable — authorize() requires the email's grant to contain
 //     the target slug — so keeping it only bloats the store). Email-less
 //     defensive tokens are retained; they are a legacy artifact, not an orphan.
-function pruneAuthState(state) {
+export function pruneAuthState(state) {
   const now = Date.now();
   for (const [hash, code] of Object.entries(state.magic)) {
     if (code && typeof code.exp === 'number' && code.exp < now) delete state.magic[hash];
@@ -657,7 +657,7 @@ function pruneAuthState(state) {
 // Write the whole auth store back as a single encrypted blob. Returns
 // { ok:true, error:null } on success, or { ok:false, error } when AUTH_KEY is
 // missing/invalid and the store can't be encrypted. Never throws.
-async function writeAuthState(env, state) {
+export async function writeAuthState(env, state) {
   pruneAuthState(state);
   const blob = await encryptState(env, state);
   if (!blob) {
@@ -672,7 +672,7 @@ async function writeAuthState(env, state) {
 // Shared read -> mutate in place -> write loop. Returns { ok, state?, error? }.
 // ok is false (with a message) if the store couldn't be read or written; the
 // caller decides the 503.
-async function mutateState(env, fn) {
+export async function mutateState(env, fn) {
   const state = await readAuthState(env);
   if (!state) return { ok: false, error: 'auth state unavailable' };
   fn(state);
@@ -682,7 +682,7 @@ async function mutateState(env, fn) {
 }
 
 // Parse a JSON request body. Returns { ok:true, data } or { ok:false, error }.
-async function readJsonBody(request) {
+export async function readJsonBody(request) {
   let text;
   try {
     text = await request.text();
@@ -706,7 +706,7 @@ async function readJsonBody(request) {
  * Admin gate for site creation. `env.ADMIN_TOKEN_HASH` is the SHA-256 hex of
  * the admin token, set as a Worker secret (never stored in the bucket).
  */
-async function authorizeAdmin(env, request) {
+export async function authorizeAdmin(env, request) {
   const token = bearerToken(request);
   if (!token) return { ok: false, status: 401, error: 'missing admin bearer token' };
 
@@ -740,7 +740,7 @@ async function writeJsonMap(env, key, map) {
  * hashes are 256-bit random values, so a timing side channel on a single key probe
  * leaks nothing brute-forceable.
  */
-async function authorize(env, slug, request) {
+export async function authorize(env, slug, request) {
   const token = bearerToken(request);
   if (!token) return { ok: false, status: 401, error: 'missing bearer token' };
 
@@ -778,7 +778,7 @@ async function authorize(env, slug, request) {
  * may validly satisfy the other. Returns the passing check, else the editor
  * check's failure result.
  */
-async function authorizeAdminOrEditor(env, slug, request) {
+export async function authorizeAdminOrEditor(env, slug, request) {
   const admin = await authorizeAdmin(env, request);
   if (admin.ok) return admin;
   return authorize(env, slug, request);
@@ -796,7 +796,7 @@ async function authorizeAdminOrEditor(env, slug, request) {
  * currently an authorized editor of at least one site, per the same grant check
  * authorize() applies). Email-less defensive tokens and non-editor tokens fail.
  */
-async function authorizeAdminOrEditorAny(env, request) {
+export async function authorizeAdminOrEditorAny(env, request) {
   const admin = await authorizeAdmin(env, request);
   if (admin.ok) return admin;
 
@@ -1122,16 +1122,16 @@ async function deleteCustomDomain(env, slug) {
 // /sites/list (which is R2-prefix based) even before any content is written.
 // It contains a `.` so it is outside the token charset and therefore can never
 // be written or overwritten by a client (clients can only write tokens).
-const SITE_MARKER = '.site';
+export const SITE_MARKER = '.site';
 
 // Lifespan of a pending magic link (one-time code) before it expires and can no
 // longer be exchanged for an editor token.
-const MAGIC_TTL_MS = 15 * 60 * 1000;
+export const MAGIC_TTL_MS = 15 * 60 * 1000;
 
 // Single encrypted credential store at the bucket root (replaces auth.json,
 // magic.json, emails.json). Its plaintext payload is { emails, tokens, magic }.
-const AUTH_FILE = 'auth.enc';
-const AUTH_STATE_V = 1; // encrypted-blob format version
+export const AUTH_FILE = 'auth.enc';
+export const AUTH_STATE_V = 1; // encrypted-blob format version
 
 // Cache-Control policies written into every object's httpMetadata. The bucket is
 // published read-only at data.parroquia.app (R2 custom domain), which only treats
@@ -1140,16 +1140,16 @@ const AUTH_STATE_V = 1; // encrypted-blob format version
 // DYNAMIC. Hashed media (content-hashed filename → new URL per change) is safe to
 // mark immutable; "living" files (config.json, slugs.json) must revalidate so they
 // never go stale for a whole year, and any non-busted consumer still gets fresh data.
-const CACHE_IMMUTABLE = 'public, max-age=31536000, immutable';
-const CACHE_REVALIDATE = 'public, max-age=0, must-revalidate';
-const LIVING_FILES = new Set(['config.json', 'slugs.json']);
+export const CACHE_IMMUTABLE = 'public, max-age=31536000, immutable';
+export const CACHE_REVALIDATE = 'public, max-age=0, must-revalidate';
+export const LIVING_FILES = new Set(['config.json', 'slugs.json']);
 
 // Request-body size caps. JSON/patch bodies are read into memory before parsing
 // (a giant body is a memory/CPU abuse vector). The PUT path enforces a
 // Content-Length pre-check; the body itself is streamed straight into R2.
-const MAX_JSON_BODY = 1024 * 1024; // 1 MiB — auth/editors/clone/create JSON bodies
-const MAX_PATCH_BODY = 5 * 1024 * 1024; // 5 MiB — config.json patch op payloads
-const MAX_FILE_BYTE = 20 * 1024 * 1024; // 20 MiB — file content (PUT)
+export const MAX_JSON_BODY = 1024 * 1024; // 1 MiB — auth/editors/clone/create JSON bodies
+export const MAX_PATCH_BODY = 5 * 1024 * 1024; // 5 MiB — config.json patch op payloads
+export const MAX_FILE_BYTE = 20 * 1024 * 1024; // 20 MiB — file content (PUT)
 
 // Auto-build: where to dispatch the deploy workflow when a site's config.json is
 // written. The workflow (web-template/.github/workflows/deploy.yml) accepts a
