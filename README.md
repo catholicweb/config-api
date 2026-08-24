@@ -518,6 +518,16 @@ Optional non-secret var: `MAGIC_LINK_BASE` (default
 > worker also no longer reads or deletes legacy `auth.json`/`magic.json`/`emails.json`;
 > delete them manually if any remain in the bucket.
 
+## opus-youtube-subscriptions
+Config.json may include `info.social` with YouTube channels. The worker tracks
+current PubSubHubbub subscriptions in `<slug>/config.json` under `dev.subscribedto[]`
+(channel IDs only). When config.json is edited, new channels are subscribed and
+added to the array (quick zero-file-read check). A secret-token-protected
+`POST /webhook/youtube?token=<WEBHOOK_SECRET>` endpoint receives PubSubHubbub
+updates; when a new video arrives it triggers `githubDispatch` for the slug.
+Requires `PUBSUBHUBBUB_HUB`, `WEBHOOK_SECRET` env (optional; subscribe is
+best-effort and never blocks saves).
+
 ## GitHub
 
 Canonical URL: <https://github.com/catholicweb/config-api>

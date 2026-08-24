@@ -394,6 +394,11 @@ export default {
       return deleteFile(env, slug, token);
     }
 
+    // POST /webhook/youtube — PubSubHubbub webhook (secret token protected)
+    if (method === 'POST' && segments.length === 2 && segments[0] === 'webhook' && segments[1] === 'youtube') {
+      return webhookYouTube(ctx, env, request, url);
+    }
+
     return new Response('Not Found', { status: 404 });
     } catch (err) {
       // Log for the operator; never echo internals (paths, messages, secrets) to
@@ -2133,7 +2138,20 @@ async function putFile(ctx, env, slug, token, request) {
   if (!Number.isNaN(declared) && declared > MAX_FILE_BYTE) {
     return Response.json({ ok: false, error: 'file too large' }, { status: 413 });
   }
-  await env.CONTENT.put(key, request.body, {
+  const isConfig = token === 'config.json';
+  let bodyToWrite = request.body;
+  if (isConfig) {
+    const text = await request.text();
+    let doc;
+    try {
+      doc = JSON.parse(text);
+    } catch {
+      return Response.json({ ok: false, error: 'Invalid JSON for config.json' }, { status: 400 });
+    }
+    doc = await updateSubscribedTo(doc, env);
+    bodyToWrite = JSON.stringify(doc, null, 2) + '\n';
+  }
+  await env.CONTENT.put(key, bodyToWrite, {
     httpMetadata: { contentType, cacheControl },
   });
   // Auto-build: whenever a site's config.json is saved, trigger a page build
@@ -2184,6 +2202,7 @@ async function patchConfigFile(ctx, env, slug, request) {
   }
   // applyPatch mutates `doc` in place (only allocation is parse/stringify).
   const { data, skipped } = applyPatch(doc, body.ops);
+  await updateSubscribedTo(data, env); // opus-youtube: sync subscriptions
   const text = JSON.stringify(data, null, 2) + '\n';
   await env.CONTENT.put(key, text, {
     httpMetadata: { contentType: 'application/json; charset=utf-8', cacheControl: CACHE_REVALIDATE },
@@ -2239,3 +2258,89 @@ async function deleteFile(env, slug, token) {
   await env.CONTENT.delete(key);
   return Response.json({ ok: true, slug, key, url: fileUrl(env, slug, token) }, { status: 200 });
 }
+
+// --- opus-youtube-subscriptions helpers ---
+
+function extractYouTubeChannels(doc) {
+  const channels = [];
+  const social = doc?.info?.social || doc?.config?.info?.social || doc?.info || {};
+  if (Array.isArray(social)) {
+    for (const item of social) {
+      if (typeof item === "string") {
+        const m = item.match(/(?:youtube\.com\/channel\/|youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/c\/)([A-Za-z0-9_-]+)/);
+        if (m) channels.push(m[1]);
+      } else if (item && typeof item === "object") {
+        const url = item.url || item.link || item.youtube || "";
+        const m = String(url).match(/(?:youtube\.com\/channel\/|youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/c\/)([A-Za-z0-9_-]+)/);
+        if (m) channels.push(m[1]);
+      }
+    }
+  } else if (typeof social === "object" && social !== null) {
+    for (const key in social) {
+      const val = social[key];
+      if (typeof val === "string") {
+        const m = val.match(/(?:youtube\.com\/channel\/|youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/c\/)([A-Za-z0-9_-]+)/);
+        if (m) channels.push(m[1]);
+      }
+    }
+  }
+  return [...new Set(channels)];
+}
+
+async function updateSubscribedTo(doc, env) {
+  const channels = extractYouTubeChannels(doc);
+  const current = doc?.dev?.subscribedto || [];
+  const currentSet = new Set(Array.isArray(current) ? current : []);
+  const added = [];
+  for (const ch of channels) {
+    if (!currentSet.has(ch)) {
+      currentSet.add(ch);
+      added.push(ch);
+    }
+  }
+  if (added.length > 0) {
+    if (!doc.dev) doc.dev = {};
+    doc.dev.subscribedto = Array.from(currentSet);
+    const hub = env.PUBSUBHUBBUB_HUB || "https://pubsubhubbub.appspot.com/";
+    try {
+      for (const ch of added) {
+        const topic = `https://www.youtube.com/xml/feeds/videos.xml?channel_id=${ch}`;
+        await fetch(hub, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: `hub.mode=subscribe&hub.topic=${encodeURIComponent(topic)}&hub.callback=${encodeURIComponent("https://api.parroquia.app/webhook/youtube?token=" + (env.WEBHOOK_SECRET || ""))}`,
+        });
+      }
+    } catch {
+      // Best-effort subscribe; failure should not block config save.
+    }
+  }
+  return doc;
+}
+
+async function webhookYouTube(ctx, env, request, url) {
+  const token = url.searchParams.get("token");
+  if (!token || token !== (env.WEBHOOK_SECRET || "")) {
+    return new Response("Forbidden", { status: 403 });
+  }
+  let payload;
+  try {
+    payload = await request.text();
+  } catch {
+    return new Response("Bad Request", { status: 400 });
+  }
+  let slug = null;
+  const slugMatch = payload.match(/"slug"\s*[:=]\s*"([^"]+)"/);
+  if (slugMatch) slug = slugMatch[1];
+  if (!slug) {
+    const m = payload.match(/https?:\/\/[^/]+\/sites\/([a-zA-Z0-9_-]+)/);
+    if (m) slug = m[1];
+  }
+  if (!slug) {
+    return Response.json({ ok: true, note: "received, slug not resolved" }, { status: 200 });
+  }
+  if (!validateSlug(slug)) return new Response("Invalid slug", { status: 400 });
+  if (ctx?.waitUntil) ctx.waitUntil(githubDispatch(env, slug));
+  return Response.json({ ok: true, slug, trigger: "youtube-subscription" }, { status: 200 });
+}
+
