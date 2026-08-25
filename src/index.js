@@ -2095,8 +2095,7 @@ async function listSlugs(env) {
 }
 
 // Returns the list of file URLs under a slug: one absolute public URL per file
-// (https://data.parroquia.app/<slug>/<token>). The site's config.json is
-// excluded from the public file list. Consumers treat these as opaque absolute URLs.
+// (https://data.parroquia.app/<slug>/<token>).
 async function listFiles(env, slug) {
   const prefix = `${slug}/`;
   const files = [];
@@ -2105,9 +2104,6 @@ async function listFiles(env, slug) {
     const listed = await env.CONTENT.list({ limit: 1000, cursor, prefix });
     for (const o of listed.objects) {
       const token = o.key.slice(prefix.length); // strip "<slug>/"
-      // .site marker removed; config.json is treated as the site's config file
-      // (not listed as a public file), but if it appears here skip it.
-      if (token === 'config.json') continue; // config file, not public content
       files.push(fileUrl(env, slug, token));
     }
     cursor = listed.truncated ? listed.cursor : undefined;
