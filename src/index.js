@@ -2260,7 +2260,7 @@ function extractYouTubeChannels(doc) {
   if (Array.isArray(social)) {
     for (const item of social) {
       if (typeof item === "string") {
-        const m = item.match(/(?:youtube\.com\/channel\/|youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/c\/)([A-Za-z0-9_-]+)/);
+        const m = item.match(/(?:youtube\.com\/channel\/|youtu\.be\/|youtube\.com\/c\/|youtube\.com\/@)([A-Za-z0-9_-]+)/);
         if (m) channels.push(m[1]);
       } else if (item && typeof item === "object") {
         const url = item.url || item.link || item.youtube || "";
@@ -2280,15 +2280,31 @@ function extractYouTubeChannels(doc) {
   return [...new Set(channels)];
 }
 
+async function resolveYouTubeChannelId(handleOrId, env) {
+  if (String(handleOrId).startsWith('UC')) return handleOrId;
+  if (!env.YOUTUBE_API_KEY) return handleOrId; // best-effort: needs API key
+  try {
+    const url = `https://www.googleapis.com/youtube/v3/channels?part=id&forHandle=${encodeURIComponent(String(handleOrId))}&key=${env.YOUTUBE_API_KEY}`;
+    const res = await fetch(url);
+    if (!res.ok) return handleOrId;
+    const data = await res.json();
+    if (data.items && data.items[0] && data.items[0].id) return data.items[0].id;
+  } catch {
+    // best-effort resolution
+  }
+  return handleOrId;
+}
+
 async function updateSubscribedTo(doc, env) {
   const channels = extractYouTubeChannels(doc);
   const current = doc?.dev?.subscribedto || [];
   const currentSet = new Set(Array.isArray(current) ? current : []);
   const added = [];
   for (const ch of channels) {
-    if (!currentSet.has(ch)) {
-      currentSet.add(ch);
-      added.push(ch);
+    const resolved = await resolveYouTubeChannelId(ch, env);
+    if (!currentSet.has(resolved)) {
+      currentSet.add(resolved);
+      added.push(resolved);
     }
   }
   if (added.length > 0) {
@@ -2336,4 +2352,6 @@ async function webhookYouTube(ctx, env, request, url) {
   if (ctx?.waitUntil) ctx.waitUntil(githubDispatch(env, slug));
   return Response.json({ ok: true, slug, trigger: "youtube-subscription" }, { status: 200 });
 }
+
+export { extractYouTubeChannels, updateSubscribedTo, webhookYouTube, resolveYouTubeChannelId };
 
