@@ -2194,8 +2194,8 @@ async function patchConfigFile(ctx, env, slug, request) {
     );
   }
   // applyPatch mutates `doc` in place (only allocation is parse/stringify).
-  const { data, skipped } = applyPatch(doc, body.ops);
-  await updateSubscribedTo(data, env); // opus-youtube: sync subscriptions
+  let { data, skipped } = applyPatch(doc, body.ops);
+  data = await updateSubscribedTo(data, env); // opus-youtube: sync subscriptions
   const text = JSON.stringify(data, null, 2) + '\n';
   await env.CONTENT.put(key, text, {
     httpMetadata: { contentType: 'application/json; charset=utf-8', cacheControl: CACHE_REVALIDATE },
@@ -2301,25 +2301,27 @@ async function updateSubscribedTo(doc, env) {
   const currentSet = new Set(Array.isArray(current) ? current : []);
   const added = [];
   for (const ch of channels) {
-    const resolved = await resolveYouTubeChannelId(ch, env);
-    if (!currentSet.has(resolved)) {
-      currentSet.add(resolved);
-      added.push(resolved);
+    if (!currentSet.has(ch)) {
+      currentSet.add(ch);
+      added.push(ch);
     }
   }
   if (added.length > 0) {
-    if (!doc.dev) doc.dev = {};
-    doc.dev.subscribedto = Array.from(currentSet);
     const hub = env.PUBSUBHUBBUB_HUB || "https://pubsubhubbub.appspot.com/";
     try {
       for (const ch of added) {
-        const topic = `https://www.youtube.com/xml/feeds/videos.xml?channel_id=${ch}`;
+        const resolved = await resolveYouTubeChannelId(ch, env);
+        currentSet.add(resolved); // add also the resolved channel id
+        const topic = `https://www.youtube.com/xml/feeds/videos.xml?channel_id=${resolved}`;
         await fetch(hub, {
           method: "POST",
           headers: { "Content-Type": "application/x-www-form-urlencoded" },
           body: `hub.mode=subscribe&hub.topic=${encodeURIComponent(topic)}&hub.callback=${encodeURIComponent("https://api.parroquia.app/webhook/youtube?token=" + (env.WEBHOOK_SECRET || ""))}`,
         });
       }
+      // add new elements only if subscriptions works
+      if (!doc.dev) doc.dev = {};
+      doc.dev.subscribedto = Array.from(currentSet);
     } catch {
       // Best-effort subscribe; failure should not block config save.
     }
