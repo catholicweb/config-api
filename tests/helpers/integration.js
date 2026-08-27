@@ -66,9 +66,9 @@ export async function seedTemplate(r2, template = { name: 'My Site', version: 1 
   });
 }
 
-/** Seed a site marker so siteExists() returns true. */
+/** Seed a site marker so siteExists() returns true (config.json is the marker). */
 export async function seedSiteMarker(r2, slug) {
-  await r2.put(`${slug}/.site`, '{"ok":true}', {
+  await r2.put(`${slug}/config.json`, '{"ok":true}\n', {
     httpMetadata: { contentType: 'application/json', cacheControl: 'public, max-age=0, must-revalidate' },
   });
 }

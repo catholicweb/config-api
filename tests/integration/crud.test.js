@@ -206,10 +206,10 @@ describe('PATCH /sites/:slug/config.json — diff apply', () => {
     expect(storedJson.name).toBe('My Site');
   });
 
-  it('returns 404 if config.json does not exist', async () => {
+  it('returns 404 if site does not exist', async () => {
     const r2 = new MockR2();
     const env = await makeTestEnv(r2);
-    await seedSiteMarker(r2, 'myslug');
+    // No seedSiteMarker — slug does not exist
     const { token: editorToken } = await seedEditor(r2, env, 'editor@example.com', 'myslug');
 
     const ctx = makeCtx();

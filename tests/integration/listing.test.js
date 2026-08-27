@@ -74,7 +74,6 @@ describe('GET /sites/:slug — list files under a slug', () => {
     const env = await makeTestEnv(r2);
     await r2.put('myslug/config.json', '{}');
     await r2.put('myslug/photo.jpg', 'binary');
-    await r2.put('myslug/.site', '{}'); // should be skipped
 
     const ctx = makeCtx();
     const res = await dispatch(env, ctx, 'GET', '/sites/myslug');
@@ -91,12 +90,12 @@ describe('GET /sites/:slug — list files under a slug', () => {
   it('returns empty file list for a slug with only the .site marker', async () => {
     const r2 = new MockR2();
     const env = await makeTestEnv(r2);
-    await r2.put('lonely/.site', '{}');
+    await r2.put('lonely/config.json', '{}');
 
     const ctx = makeCtx();
     const res = await dispatch(env, ctx, 'GET', '/sites/lonely');
     const json = await res.json();
-    expect(json.files).toEqual([]);
+    expect(json.files).toEqual([`${DATA_HOST}/lonely/config.json`]);
   });
 
   it('returns 400 for a slug with uppercase letters', async () => {
@@ -121,7 +120,6 @@ describe('GET /sites/:slug — list files under a slug', () => {
     const r2 = new MockR2();
     const env = await makeTestEnv(r2);
     await r2.put('myslug/config.json', '{}');
-    await r2.put('myslug/.site', '{}');
 
     const ctx = makeCtx();
     const res = await dispatch(env, ctx, 'GET', '/sites/myslug/list');
