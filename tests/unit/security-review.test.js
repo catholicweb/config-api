@@ -16,7 +16,7 @@ describe('security review — path/file attacks', () => {
 describe('security review — auth/crypto', () => {
   it('timing-safe comparison conceptual guard exists', () => {
     // Direct token probe (256-bit random hash) vs sweep — defense documented
-    expect(typeof 'direct'].key).toBe('undefined');
+    expect(typeof 'direct'.key).toBe('undefined');
   });
   it('auth.enc single-point-of-failure noted', () => {
     // No migration path; back up AUTH_KEY

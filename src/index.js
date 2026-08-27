@@ -2104,6 +2104,7 @@ async function listFiles(env, slug) {
     const listed = await env.CONTENT.list({ limit: 1000, cursor, prefix });
     for (const o of listed.objects) {
       const token = o.key.slice(prefix.length); // strip "<slug>/"
+      if (token === '.site') continue; // site marker, not a public file
       files.push(fileUrl(env, slug, token));
     }
     cursor = listed.truncated ? listed.cursor : undefined;
