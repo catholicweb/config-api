@@ -434,7 +434,9 @@ describe('authorize (editor gate for slug)', () => {
     });
     const req = makeRequest(token);
     const result = await authorize(env, 'myslug', req);
-    expect(result.ok).toBe(true);
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe(403);
+    expect(result.error).toBe('editor token requires bound email');
   });
 
   it('returns 403 for email-less defensive token on a different slug', async () => {
@@ -451,7 +453,7 @@ describe('authorize (editor gate for slug)', () => {
     const result = await authorize(env, 'other-slug', req);
     expect(result.ok).toBe(false);
     expect(result.status).toBe(403);
-    expect(result.error).toBe('token not valid for this slug');
+    expect(result.error).toBe('editor token requires bound email');
   });
 
   it('returns 503 when auth state is unavailable (corrupt auth.enc)', async () => {

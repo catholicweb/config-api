@@ -758,11 +758,7 @@ export async function authorize(env, slug, request) {
     return { ok: false, status: 403, error: 'token not valid' };
   }
   if (entry.email == null) {
-    // Email-less (defensive) token: keep old single-slug semantics — only valid
-    // for the exact slug it was minted for, never for other slugs.
-    return entry.slug === slug
-      ? { ok: true }
-      : { ok: false, status: 403, error: 'token not valid for this slug' };
+    return { ok: false, status: 403, error: 'editor token requires bound email' };
   }
 
   // Multisession: an email-bound token authorizes every slug the email is granted
@@ -838,7 +834,7 @@ async function whoami(env, request) {
   // Multisession identity: the editor needs the full roster of slugs its email can
   // edit to render the site switcher. `slug` stays for backward compatibility.
   if (entry.email == null) {
-    return Response.json({ slug: entry.slug, email: null, slugs: [entry.slug] });
+    return new Response('invalid token', { status: 403 });
   }
   const slugs = (state.emails[entry.email] || []).filter(Boolean);
   return Response.json({ slug: entry.slug, email: entry.email, slugs });
@@ -2357,3 +2353,9 @@ async function webhookYouTube(ctx, env, request, url) {
 
 export { extractYouTubeChannels, updateSubscribedTo, webhookYouTube, resolveYouTubeChannelId };
 
+// SECURITY NOTES (updated 2026-08-27):
+// - Site existence disclosure (404 vs 200 for slug) is NOT a security issue;
+//   sites are public via data.parroquia.app by design.
+// - AUTH_KEY is the single point of failure: back it up, rotate if leaked.
+// - Rate limiting should be handled externally (Cloudflare Rate Limiting rules),
+//   not in this worker (stateless per-request).
