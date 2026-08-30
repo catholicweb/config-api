@@ -1239,6 +1239,10 @@ function addEmailGrant(state, email, slug) {
  * mass-creation.
  */
 async function createSite(ctx, env, slug, email) {
+  if (typeof email !== 'string' || !validateEmail(email)) {
+    return Response.json({ ok: false, error: 'a valid email is required' }, { status: 400 });
+  }
+  const normalizedEmail = normalizeEmail(email);
   if (!env.RESEND_API_KEY) {
     return Response.json(
       { ok: false, error: 'magic-link email not configured (RESEND_API_KEY not set)' },
@@ -1322,10 +1326,10 @@ async function createSite(ctx, env, slug, email) {
 
   // Grant the owner editor access (the encrypted email allowlist is the enforced
   // allowlist) and email them their first login link.
-  const mres = await mutateState(env, (s) => addEmailGrant(s, normalizeEmail(email), slug));
+  const mres = await mutateState(env, (s) => addEmailGrant(s, normalizedEmail, slug));
   if (!mres.ok) return Response.json({ error: mres.error }, { status: 503 });
 
-  const issued = await issueMagicLink(env, [slug], email);
+  const issued = await issueMagicLink(env, [slug], normalizedEmail);
   if (!issued.ok) {
     return Response.json({ ok: false, error: issued.error }, { status: issued.status });
   }
