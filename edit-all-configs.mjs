@@ -22,6 +22,9 @@
  *     slug …      Optional slugs to target (default: all from slugs.json)
  */
 
+const fs = require('fs');
+const path = require('path');
+
 const ADMIN_TOKEN = process.env.PARROQUIA_ADMIN_TOKEN?.trim();
 if (!ADMIN_TOKEN) {
   console.error("Missing required env var: PARROQUIA_ADMIN_TOKEN");
@@ -158,6 +161,12 @@ async function main() {
       touched++;
       continue;
     }
+
+    // Write local backup before modifying
+    const ts = new Date();
+    const backupDir = '.backup/' + ts.getFullYear() + String(ts.getMonth()+1).padStart(2,'0') + String(ts.getDate()).padStart(2,'0') + '-' + String(ts.getHours()).padStart(2,'0') + String(ts.getMinutes()).padStart(2,'0') + String(ts.getSeconds()).padStart(2,'0');
+    fs.mkdirSync(backupDir, { recursive: true });
+    fs.writeFileSync(path.join(backupDir, slug + '.json'), raw);
 
     // PUT the replaced config back
     const putRes = await fetchJson(`${API_BASE}/sites/${slug}/config.json`, {
