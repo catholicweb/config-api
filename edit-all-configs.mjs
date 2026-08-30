@@ -44,7 +44,9 @@ const targetSlugs = args; // empty = all
 // ==== REPLACER ================================================================
 // Transform the config.json file text -> new config.json file text.
 // Edit this to perform your replacement (e.g. a replaceAll on the raw string).
-const replacer = (configText) => configText;
+const replacer = (configText){
+  return configText
+}
 // ============================================================================
 
 async function fetchJson(url, opts) {
@@ -129,7 +131,8 @@ async function main() {
     const sizeKB = (newBody.length / 1024).toFixed(1);
 
     if (DRY_RUN) {
-      console.log(`WOULD PUT (${sizeKB} KB)`);
+      console.log(`======= WOULD PUT (${sizeKB} KB) @ ${slug} =========`);
+      console.log(newBody)
       touched++;
       continue;
     }
