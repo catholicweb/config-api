@@ -44,8 +44,30 @@ const targetSlugs = args; // empty = all
 // ==== REPLACER ================================================================
 // Transform the config.json file text -> new config.json file text.
 // Edit this to perform your replacement (e.g. a replaceAll on the raw string).
-const replacer = (configText){
-  return configText
+function walk(obj) {
+  if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+    if (obj.type === 'gallery' && Object.prototype.hasOwnProperty.call(obj, 'list')) {
+      obj.images = obj.list;
+      delete obj.list;
+    }
+    for (const key of Object.keys(obj)) {
+      walk(obj[key]);
+    }
+  } else if (Array.isArray(obj)) {
+    for (let i = 0; i < obj.length; i++) {
+      walk(obj[i]);
+    }
+  }
+}
+
+const replacer = (configText) => {
+  try {
+    const obj = JSON.parse(configText);
+    walk(obj);
+    return JSON.stringify(obj, null, 2);
+  } catch {
+    return configText;
+  }
 }
 // ============================================================================
 
