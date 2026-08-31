@@ -48,6 +48,80 @@ describe('updateSubscribedTo', () => {
   });
 });
 
+describe('webhookYouTube deep test (youtube-subscriptions-deeptest)', () => {
+  const envSec = { WEBHOOK_SECRET: 'deeptest-secret' };
+  const ctx = { waitUntil: () => {} };
+
+  it('GET with hub.challenge returns challenge (PubSubHubbub verification)', async () => {
+    const url = new URL('https://example.com/webhook/youtube?token=deeptest-secret&hub.challenge=abc123');
+    const req = new Request(url.toString(), { method: 'GET' });
+    const res = await webhookYouTube(ctx, envSec, req, url);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe('abc123');
+  });
+
+  it('GET without challenge returns 200 note', async () => {
+    const url = new URL('https://example.com/webhook/youtube?token=deeptest-secret');
+    const req = new Request(url.toString(), { method: 'GET' });
+    const res = await webhookYouTube(ctx, envSec, req, url);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    expect(body.note).toContain('GET verified');
+  });
+
+  it('GET with bad token is 403', async () => {
+    const url = new URL('https://example.com/webhook/youtube?token=bad');
+    const req = new Request(url.toString(), { method: 'GET' });
+    const res = await webhookYouTube(ctx, envSec, req, url);
+    expect(res.status).toBe(403);
+  });
+
+  it('POST without token is 403', async () => {
+    const url = new URL('https://example.com/webhook/youtube');
+    const req = new Request(url.toString(), { method: 'POST', body: '{}' });
+    const res = await webhookYouTube(ctx, envSec, req, url);
+    expect(res.status).toBe(403);
+  });
+
+  it('POST with slug in payload resolves slug', async () => {
+    const url = new URL('https://example.com/webhook/youtube?token=deeptest-secret');
+    const req = new Request(url.toString(), { method: 'POST', body: '{"slug":"testsite"}' });
+    const res = await webhookYouTube(ctx, envSec, req, url);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    expect(body.slug).toBe('testsite');
+    expect(body.trigger).toBe('youtube-subscription');
+  });
+
+  it('POST with URL slug match resolves slug', async () => {
+    const url = new URL('https://example.com/webhook/youtube?token=deeptest-secret');
+    const req = new Request(url.toString(), { method: 'POST', body: 'https://api.parroquia.app/sites/my-site' });
+    const res = await webhookYouTube(ctx, envSec, req, url);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.slug).toBe('my-site');
+  });
+
+  it('POST with invalid slug returns 400', async () => {
+    const url = new URL('https://example.com/webhook/youtube?token=deeptest-secret');
+    const req = new Request(url.toString(), { method: 'POST', body: '{"slug":"bad/slug"}' });
+    const res = await webhookYouTube(ctx, envSec, req, url);
+    expect(res.status).toBe(400);
+  });
+
+  it('POST with unresolvable slug returns ok with note', async () => {
+    const url = new URL('https://example.com/webhook/youtube?token=deeptest-secret');
+    const req = new Request(url.toString(), { method: 'POST', body: '{}' });
+    const res = await webhookYouTube(ctx, envSec, req, url);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    expect(body.note).toContain('slug not resolved');
+  });
+});
+
 describe('webhookYouTube', () => {
   it('returns 403 for bad token', async () => {
     const req = new Request('https://example.com/webhook/youtube?token=bad', { method: 'POST', body: '{}' });
