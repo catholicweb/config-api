@@ -394,9 +394,11 @@ export default {
       return deleteFile(env, slug, token);
     }
 
-    // POST /webhook/youtube — PubSubHubbub webhook (secret token protected)
-    if (method === 'POST' && segments.length === 2 && segments[0] === 'webhook' && segments[1] === 'youtube') {
-      return webhookYouTube(ctx, env, request, url);
+    // POST / GET /webhook/youtube — PubSubHubbub webhook (secret token protected)
+    if (segments.length === 2 && segments[0] === 'webhook' && segments[1] === 'youtube') {
+      if (method === 'POST' || method === 'GET') {
+        return webhookYouTube(ctx, env, request, url);
+      }
     }
 
     return new Response('Not Found', { status: 404 });
@@ -2333,6 +2335,14 @@ async function webhookYouTube(ctx, env, request, url) {
   const token = url.searchParams.get("token");
   if (!token || token !== (env.WEBHOOK_SECRET || "")) {
     return new Response("Forbidden", { status: 403 });
+  }
+  // PubSubHubbub verification sends GET with hub.challenge
+  if (request.method === "GET") {
+    const challenge = url.searchParams.get("hub.challenge");
+    if (challenge) {
+      return new Response(challenge, { status: 200, headers: { "Content-Type": "text/plain" } });
+    }
+    return Response.json({ ok: true, note: "GET verified" }, { status: 200 });
   }
   let payload;
   try {
