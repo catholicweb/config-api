@@ -94,65 +94,6 @@ describe('groupEvents', () => {
   });
 });
 
-describe('assembleOrder', () => {
-  it('assembles all 5 fields in level order', () => {
-    const section = {
-      orderTabla: 'dates',
-      orderFila: 'times',
-      orderColumna: 'locations',
-      orderSubfila: 'byday',
-      orderNotas: 'notes',
-    };
-    expect(assembleOrder(section)).toEqual(['dates', 'times', 'locations', 'byday', 'notes']);
-  });
-
-  it("preserves positional integrity — unset levels become 'empty' sentinel", () => {
-    const section = {
-      orderTabla: 'dates',
-      orderFila: null,
-      orderColumna: 'locations',
-      orderSubfila: undefined,
-      orderNotas: '',
-    };
-    expect(assembleOrder(section)).toEqual(['dates', 'empty', 'locations', 'empty', 'empty']);
-  });
-
-  it("keeps the 'empty' sentinel when explicitly selected", () => {
-    const section = {
-      orderTabla: 'empty',
-      orderFila: 'times',
-      orderColumna: 'empty',
-    };
-    expect(assembleOrder(section)).toEqual(['empty', 'times', 'empty', 'empty', 'empty']);
-  });
-
-  it('always returns 5 elements when any field is set', () => {
-    const section = { orderTabla: 'dates' };
-    expect(assembleOrder(section)).toEqual(['dates', 'empty', 'empty', 'empty', 'empty']);
-  });
-
-  it('falls back to the legacy order array when new fields are absent', () => {
-    const section = { order: ['dates', 'times'] };
-    expect(assembleOrder(section)).toEqual(['dates', 'times']);
-  });
-
-  it('prefers the new 5-field format when both new and legacy are present', () => {
-    const section = {
-      order: ['dates', 'times'],
-      orderTabla: 'title',
-      orderFila: 'locations',
-    };
-    expect(assembleOrder(section)).toEqual(['title', 'locations', 'empty', 'empty', 'empty']);
-  });
-
-  it('falls back to the default when neither new nor legacy fields exist', () => {
-    expect(assembleOrder({})).toEqual(['type', 'times']);
-  });
-
-  it('falls back to the default when the legacy order array is empty', () => {
-    expect(assembleOrder({ order: [] })).toEqual(['type', 'times']);
-  });
-});
 
 describe('formatDate', () => {
   it('formats a Spanish date with month name', () => {

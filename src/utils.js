@@ -1,7 +1,4 @@
 // COPIED from docs/.vitepress/utils.js — keep in sync with the original in web-template.
-// The config-api Worker can't import modules from the web-template package path,
-// so this duplicate is maintained here. When the upstream utils.js changes,
-// copy it here too.
 export function groupEvents(events, fields = []) {
   if (fields.length === 0) return events;
   const field = fields[0];
@@ -29,38 +26,19 @@ export function groupEvents(events, fields = []) {
   return grouped;
 }
 
-// Assembles the event grouping order from the new per-level single-select
-// fields (orderTabla, orderFila, orderColumna, orderSubfila, orderNotas) into
-// the flat array that groupEvents() expects.  Falls back to the legacy `order`
-// array for existing configs, then to a sensible default.
-//
-// Important: groupEvents reads the array by index, so each level must stay in
-// its fixed position.  We do NOT filter out unset levels — instead we emit the
-// "empty" sentinel (a valid option from the ordering component) so positional
-// integrity is preserved.  Calendar.vue already hides "" keys via CSS
-// (h3:empty, td:empty { display: none }).
+// Stablish a new world order
 export function assembleOrder(section) {
-  const LEVELS = [
-    "orderTabla",
-    "orderFila",
-    "orderColumna",
-    "orderSubfila",
-    "orderNotas",
-  ];
 
-  // New format: always return all 5 levels in order, using "empty" as a
-  // placeholder for unset levels to preserve positional integrity.
-  if (LEVELS.some((f) => section[f])) {
-    return LEVELS.map((f) => section[f] || "empty");
-  }
-
+  const newWorlOrder = section?.ordering?.split(',')
+  if (newWorlOrder && newWorlOrder.length == 5) return newWorlOrder
+  
   // Backward compatibility: legacy `order` array
   if (Array.isArray(section.order) && section.order.length) {
     return section.order;
   }
 
   // Default fallback
-  return ["type", "times"];
+  return ["title", "dates", "skip", "times", "locations"];
 }
 
 export function toArray(value) {
@@ -183,7 +161,7 @@ export function formatDate(isoString, lang = "Español:es") {
     bg: ["Януари", "Февруари", "Март", "Април", "Май", "Юни", "Юли", "Август", "Септември", "Октомври", "Ноември", "Декември"],
     it: ["Gennaio", "Febbraio", "Marzo", "Aprile", "Maggio", "Giugno", "Luglio", "Agosto", "Settembre", "Ottobre", "Novembre", "Dicembre"],
     ro: ["Ianuarie", "Februarie", "Martie", "Aprilie", "Mai", "Iunie", "Iulie", "August", "Septembrie", "Octombrie", "Noiembrie", "Decembrie"],
-    pt: ["Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho", "Julho", "Agosto", "Setembro", "Outubro", "Novembre", "Dezembre"],
+    pt: ["Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho", "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"],
     ca: ["Gener", "Febrer", "Març", "Abril", "Maig", "Juny", "Juliol", "Agost", "Setembre", "Octubre", "Novembre", "Desembre"],
     ar: ["يناير", "فبراير", "مارس", "أبريل", "مايو", "يونيو", "يوليو", "أغسطس", "سبتمبر", "أكتوبر", "نوفمبر", "ديسمبر"],
     de: ["Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September", "Oktober", "November", "Dezember"],
@@ -335,7 +313,7 @@ function tr(str, lang = "Español:es") {
       su: "Domingo",
       "mo,tu,we,th,fr": "De segunda a sexta-feira",
       yearly: "Anualmente",
-      monthly: "Mensualmente",
+      monthly: "Mensalmente",
       biweekly: "A cada duas semanas",
       week1: "1ª semana",
       week2: "2ª semana",
@@ -406,7 +384,7 @@ export function slugify(str) {
 
   const slug = str
     .normalize("NFD")
-    .replace(/[̀-ͯ]/g, "")
+    .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase()
     .trim()
     .replace(/[^a-z0-9]+/g, "-")
@@ -424,16 +402,12 @@ function hash(s) {
 export function grid(section) {
   let { tags = [], elements = [] } = section;
 
-  // Masonry layout uses CSS columns instead of flex
-  if (tags.includes("masonry")) {
-    return "container mx-auto columns-1 sm:columns-2 md:columns-3 gap-4 *:w-full *:break-inside-avoid";
-  }
-
   // 1. Layout Base
-  const base = "container mx-auto flex";
+  const base = "container mx-auto";
   const directions = {
-    horizontal: "flex-nowrap overflow-x-scroll *:flex-shrink-0 hidescrollbar pr-8",
-    vertical: "flex-wrap justify-center text-center",
+    horizontal: "flex flex-nowrap overflow-x-scroll *:flex-shrink-0 hidescrollbar pr-8",
+    masonry: "columns-2 md:columns-3 lg:columns-4 gap-0 *:!w-1/1",
+    vertical: "flex flex-wrap justify-center text-center",
   };
   const sizes = {
     xs: "py-2 *:w-1/2 *:sm:w-1/3 *:md:w-1/6 *:p-1",
@@ -451,13 +425,13 @@ export function grid(section) {
 
   // 3. Visual modifiers (applied via Tailwind star-variants to child elements)
   const modifiers = [];
-  if (tags.includes("dense")) modifiers.push("gap-1");
-  if (tags.includes("spacious")) modifiers.push("gap-6");
-  if (tags.includes("cards")) modifiers.push("*:shadow-sm", "*:rounded-xl", "*:bg-white");
-  if (tags.includes("bordered")) modifiers.push("*:border", "*:border-gray-200");
-  if (tags.includes("flat")) modifiers.push("*:shadow-none");
+  if (tags.includes("dense")) modifiers.push("*:!p-1");
+  if (tags.includes("spacious")) modifiers.push("*:!p-4");
+  if (tags.includes("cards")) modifiers.push("[&>*>*]:!shadow-xl", "[&>*>*]:!rounded-xl", "[&>*>*]:!bg-white", "[&>*>*]:overflow-hidden");
+  if (tags.includes("bordered")) modifiers.push("[&>*>*]:!border-2", "[&>*>*]:!border-accent", "[&>*>*]:!rounded-xl");
+  if (tags.includes("flat")) modifiers.push("[&>*>*]:!hadow-none");
 
-  return `${base} ${directions[activeDirection]} ${sizes[activeSize]}${modifiers.length ? " " + modifiers.join(" ") : ""}`;
+  return `${base} ${directions[activeDirection]} ${sizes[activeSize]} ${modifiers.join(" ")}`;
 
 }
 
@@ -473,7 +447,7 @@ export function getSectionClasses(tags = []) {
   if (tags.includes("fullbleed")) {
     classes.push("w-full", "px-0");
   } else if (tags.includes("twocols")) {
-    classes.push("w-full", "md:w-1/2", "flex-none", "align-top", "px-4", "mx-auto");
+    classes.push("w-full", "md:w-1/2", "flex-none", "align-top", "px-2", "mx-auto");
   } else {
     classes.push("block", "w-full");
   }
@@ -533,16 +507,18 @@ export async function getAddress(lat, lng, name, zoom = 17) {
       return extra;
     }
 
+    // Consolidated address field only (idea: address)
+    const parts = [
+      data.address?.road || data.address?.pedestrian,
+      data.address?.hamlet || data.address?.village || data.address?.town || data.address?.city,
+      data.address?.postcode,
+      data.address?.state,
+      data.address?.country,
+    ].filter(Boolean);
+    const addressStr = data.display_name || parts.join(", ");
     return {
       ...extra,
-      street: data.address?.road || data.address?.pedestrian,
-      city: data.address?.hamlet || data.address?.village || data.address?.town || data.address?.city,
-      zip: data.address?.postcode,
-      full: data.display_name,
-      region: data.address?.state,
-      country: data.address?.country,
-      country_code: data.address?.country_code,
-      name: data.address?.amenity,
+      address: addressStr,
     };
   } catch (error) {
     console.error("Lookup failed:", error);
