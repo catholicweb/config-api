@@ -11,7 +11,7 @@ import {
 
 // --- OAuth 2.0 Token Helper for Cloudflare Workers (Web Crypto API) ---
 
-async function getGoogleAccessToken(serviceAccount) {
+export async function getGoogleAccessToken(serviceAccount) {
   const pemHeader = "-----BEGIN PRIVATE KEY-----";
   const pemFooter = "-----END PRIVATE KEY-----";
   const pemContents = serviceAccount.private_key

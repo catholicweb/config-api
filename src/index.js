@@ -24,7 +24,7 @@
 // (could be regarded as a part of the same inter-dependency contract):
 // applyPatch applies the editor's diff ops onto the stored doc.
 import { applyPatch } from './patch.js';
-import { scheduled as sendNotificationsCron } from './notifications.js';
+import { scheduled as sendNotificationsCron, getGoogleAccessToken } from './notifications.js';
 
 /**
  * parroquia-config-api
@@ -86,10 +86,9 @@ import { scheduled as sendNotificationsCron } from './notifications.js';
  *
  * FCM TOKEN SUBSCRIPTION (no auth — open to all):
  *   POST /api/fcm/token              — receive an FCM registration token from the browser and
- *                                       subscribe it to the site's FCM topic. Body:
- *                                       { "token": "<fcm-token>", "site": "<slug>" }. Calls the
- *                                       FCM legacy IID subscribe API (iid.googleapis.com) with
- *                                       env.FCM_SERVER_KEY (Worker secret). The browser can't
+ *                                       subscribe it to the site's FCM topic via FCM v1 bulk
+ *                                       subscribe (fcm.googleapis.com/fcm/subscribe) using
+ *                                       env.FCM_SERVICE_ACCOUNT (OAuth2 JWT). The browser can't
  *                                       subscribe tokens to topics itself — see
  *                                       firebase/firebase-js-sdk#5289. The call is fire-and-forget
  *                                       via ctx.waitUntil(); subscribes are idempotent.
@@ -197,7 +196,7 @@ export default {
     // subscribe it to the site's FCM topic (topic = SITE_SLUG). The browser
     // cannot subscribe tokens to topics itself (firebase/firebase-js-sdk#5289),
     // so this endpoint bridges browser → FCM subscribe HTTP API using
-    // FCM_SERVER_KEY (a Worker secret). Open to all: the token+site come from
+    // FCM_SERVICE_ACCOUNT (OAuth2 JWT via getGoogleAccessToken). Open to all: the token+site come from
     // the browser, which cannot forge a subscription it doesn't hold.
     if (method === 'POST' && segments.length === 3 && segments[0] === 'api' && segments[1] === 'fcm' && segments[2] === 'token') {
       return subscribeFcmToken(ctx, env, request);
@@ -2032,22 +2031,9 @@ async function exchangeMagic(env, request) {
 
 /**
  * POST /api/fcm/token — receive an FCM registration token from the browser
- * and subscribe it to the site's FCM topic. Topic subscription requires the
- * Firebase server key, which must never reach the browser (the Web SDK has no
- * client-side subscribeToTopic — see firebase/firebase-js-sdk#5289). This Worker
- * (a Cloudflare Worker, no Node.js / firebase-admin) calls the FCM legacy IID
- * HTTP API directly with the server key via fetch().
- *
- * The FCM IID subscribe endpoint (https://iid.googleapis.com/iid/v1/{token}/rel/topics/{topic})
- * is idempotent: re-subscribing an already-subscribed token is a no-op, so the
- * browser can POST on every page load without harm.
- *
- * ctx.waitUntil() makes the FCM call fire-and-forget so the Worker responds
- * immediately with { ok: true } and the client is never blocked by the
- * downstream FCM call latency.
- *
- * Requires env.FCM_SERVER_KEY (Worker secret). Returns { ok:true } even if the
- * key is missing; the subscription simply doesn't happen. Failures are logged.
+ * and subscribe it to the site's FCM topic. Uses FCM v1 batch subscribe
+ * via Service Account (FCM_SERVICE_ACCOUNT) so no deprecated server key
+ * reaches the browser. The call is fire-and-forget (waitUntil).
  */
 async function subscribeFcmToken(ctx, env, request) {
   const body = await readJsonBody(request);
@@ -2061,80 +2047,46 @@ async function subscribeFcmToken(ctx, env, request) {
     return Response.json({ error: 'site is required' }, { status: 400 });
   }
 
-  const serverKey = env.FCM_SERVER_KEY;
-  if (!serverKey) {
-    console.log('subscribeFcmToken: FCM_SERVER_KEY not configured; skipping subscription');
+  if (!env.FCM_SERVICE_ACCOUNT) {
+    console.log('subscribeFcmToken: FCM_SERVICE_ACCOUNT not set; skipping subscription');
     return Response.json({ ok: true }, { status: 200 });
   }
 
-  // Use ctx.waitUntil so the Worker responds immediately and the FCM call
-  // doesn't block the client. The subscribe is idempotent.
+  let serviceAccount;
+  try {
+    serviceAccount = typeof env.FCM_SERVICE_ACCOUNT === 'string'
+      ? JSON.parse(env.FCM_SERVICE_ACCOUNT)
+      : env.FCM_SERVICE_ACCOUNT;
+  } catch (e) {
+    console.error('subscribeFcmToken: failed to parse FCM_SERVICE_ACCOUNT:', e);
+    return Response.json({ ok: true }, { status: 200 });
+  }
+
   if (ctx?.waitUntil) {
     ctx.waitUntil(
-      fetch(`https://iid.googleapis.com/iid/v1/${encodeURIComponent(token)}/rel/topics/${encodeURIComponent(site)}`, {
-        method: 'POST',
-        headers: { 'Authorization': `key=${serverKey}` },
-      }).catch((e) => {
-        console.error('FCM subscribe failed:', e);
-      }),
+      (async () => {
+        try {
+          const accessToken = await getGoogleAccessToken(serviceAccount);
+          const res = await fetch('https://fcm.googleapis.com/fcm/subscribe', {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${accessToken}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              to: `/topics/${encodeURIComponent(site)}`,
+              registration_tokens: [token],
+            }),
+          });
+          console.log('subscribeFcmToken: FCM v1 subscribe', site, res.status, res.ok ? 'ok' : 'failed');
+        } catch (e) {
+          console.error('subscribeFcmToken: FCM v1 subscribe failed:', e);
+        }
+      })()
     );
   }
 
   return Response.json({ ok: true }, { status: 200 });
-}
-
-// --- OAuth 2.0 Token Helper for Cloudflare Workers (Web Crypto API) ---
-// Matches notifications.js auth upgrade (FCM HTTP v1 / Service Account).
-async function getGoogleAccessToken(serviceAccount) {
-  const pemHeader = '-----BEGIN PRIVATE KEY-----';
-  const pemFooter = '-----END PRIVATE KEY-----';
-  const pemContents = serviceAccount.private_key
-    .replace(pemHeader, '')
-    .replace(pemFooter, '')
-    .replace(/\s+/g, '');
-
-  const binaryDer = Uint8Array.from(atob(pemContents), (c) => c.charCodeAt(0));
-  const privateKey = await crypto.subtle.importKey(
-    'pkcs8',
-    binaryDer,
-    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
-    false,
-    ['sign']
-  );
-
-  const header = { alg: 'RS256', typ: 'JWT' };
-  const now = Math.floor(Date.now() / 1000);
-  const claimSet = {
-    iss: serviceAccount.client_email,
-    scope: 'https://www.googleapis.com/auth/firebase.messaging',
-    aud: 'https://oauth2.googleapis.com/token',
-    exp: now + 3600,
-    iat: now,
-  };
-
-  const encodeBase64Url = (str) =>
-    btoa(str).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
-
-  const unsignedToken = `${encodeBase64Url(JSON.stringify(header))}.${encodeBase64Url(JSON.stringify(claimSet))}`;
-  const signature = await crypto.subtle.sign(
-    'RSASSA-PKCS1-v1_5',
-    privateKey,
-    new TextEncoder().encode(unsignedToken)
-  );
-
-  const jwt = `${unsignedToken}.${encodeBase64Url(String.fromCharCode(...new Uint8Array(signature)))}`;
-
-  const res = await fetch('https://oauth2.googleapis.com/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-      assertion: jwt,
-    }),
-  });
-
-  const data = await res.json();
-  return data.access_token;
 }
 
 /**
