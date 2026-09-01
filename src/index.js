@@ -90,8 +90,8 @@ import { scheduled as sendNotificationsCron, getGoogleAccessToken } from './noti
  *                                       subscribe (fcm.googleapis.com/fcm/subscribe) using
  *                                       env.FCM_SERVICE_ACCOUNT (OAuth2 JWT). The browser can't
  *                                       subscribe tokens to topics itself — see
- *                                       firebase/firebase-js-sdk#5289. The call is fire-and-forget
- *                                       via ctx.waitUntil(); subscribes are idempotent.
+ *                                       firebase/firebase-js-sdk#5289. The call awaits
+ *                                       the FCM response so the caller confirms it.
  *
  * WRITE (admin OR editor bearer token required):
  *   PUT    /sites/:slug/:filename   — overwrite a file (filename = validated human-readable name)
@@ -2033,7 +2033,8 @@ async function exchangeMagic(env, request) {
  * POST /api/fcm/token — receive an FCM registration token from the browser
  * and subscribe it to the site's FCM topic. Uses FCM v1 batch subscribe
  * via Service Account (FCM_SERVICE_ACCOUNT) so no deprecated server key
- * reaches the browser. The call is fire-and-forget (waitUntil).
+ * reaches the browser. The call awaits Google's response so the caller can
+ * confirm registration (ok + fcmStatus + fcmBody).
  */
 async function subscribeFcmToken(ctx, env, request) {
   const body = await readJsonBody(request);
@@ -2062,31 +2063,26 @@ async function subscribeFcmToken(ctx, env, request) {
     return Response.json({ ok: true }, { status: 200 });
   }
 
-  if (ctx?.waitUntil) {
-    ctx.waitUntil(
-      (async () => {
-        try {
-          const accessToken = await getGoogleAccessToken(serviceAccount);
-          const res = await fetch('https://fcm.googleapis.com/fcm/subscribe', {
-            method: 'POST',
-            headers: {
-              'Authorization': `Bearer ${accessToken}`,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              to: `/topics/${site}`,
-              registration_ids: [token],
-            }),
-          });
-          console.log('subscribeFcmToken: FCM v1 subscribe', site, res.status, res.ok ? 'ok' : 'failed');
-        } catch (e) {
-          console.error('subscribeFcmToken: FCM v1 subscribe failed:', e);
-        }
-      })()
-    );
+  try {
+    const accessToken = await getGoogleAccessToken(serviceAccount);
+    const res = await fetch('https://fcm.googleapis.com/fcm/subscribe', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        to: `/topics/${site}`,
+        registration_ids: [token],
+      }),
+    });
+    const resBody = await res.text();
+    console.log('subscribeFcmToken: FCM v1 subscribe', site, res.status, res.ok ? 'ok' : 'failed', resBody.slice(0, 200));
+    return Response.json({ ok: res.ok, fcmStatus: res.status, fcmBody: resBody }, { status: res.ok ? 200 : 502 });
+  } catch (e) {
+    console.error('subscribeFcmToken: FCM v1 subscribe failed:', e);
+    return Response.json({ ok: false, error: 'FCM subscribe failed', detail: String(e) }, { status: 502 });
   }
-
-  return Response.json({ ok: true }, { status: 200 });
 }
 
 /**
