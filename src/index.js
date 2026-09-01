@@ -87,7 +87,7 @@ import { scheduled as sendNotificationsCron, getGoogleAccessToken } from './noti
  * FCM TOKEN SUBSCRIPTION (no auth — open to all):
  *   POST /api/fcm/token              — receive an FCM registration token from the browser and
  *                                       subscribe it to the site's FCM topic via FCM v1 bulk
- *                                       subscribe (fcm.googleapis.com/fcm/subscribe) using
+ *                                       subscribe (iid.googleapis.com/iid/v1:batchAdd) using
  *                                       env.FCM_SERVICE_ACCOUNT (OAuth2 JWT). The browser can't
  *                                       subscribe tokens to topics itself — see
  *                                       firebase/firebase-js-sdk#5289. The call awaits
@@ -2065,15 +2065,16 @@ async function subscribeFcmToken(ctx, env, request) {
 
   try {
     const accessToken = await getGoogleAccessToken(serviceAccount);
-    const res = await fetch('https://fcm.googleapis.com/fcm/subscribe', {
+    const res = await fetch('https://iid.googleapis.com/iid/v1:batchAdd', {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${accessToken}`,
         'Content-Type': 'application/json',
+        'access_token_auth': 'true',
       },
       body: JSON.stringify({
         to: `/topics/${site}`,
-        registration_ids: [token],
+        registration_tokens: [token],
       }),
     });
     const resBody = await res.text();

@@ -1,7 +1,7 @@
 // Simple helper: notify slug "test" via admin bearer token from env
 // Usage: ADMIN_TOKEN=xxx node notify-test.mjs
 const SLUG = 'test';
-const URL = `http://localhost:8787/sites/${SLUG}/notify`;
+const URL = `https://api.parroquia.app/sites/${SLUG}/notify`;
 
 const adminToken = process.env.ADMIN_TOKEN;
 if (!adminToken) {
