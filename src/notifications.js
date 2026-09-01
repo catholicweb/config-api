@@ -1,7 +1,7 @@
 // src/notifications.js
 // Daily cron handler: for each site in slugs.json, fetch its calendar.json from
 // the deployed Pages site, find tomorrow's events, and send an FCM topic
-// message to /topics/<slug> via the FCM HTTP API using FCM_SERVER_KEY.
+// message via the FCM HTTP v1 API using a Service Account JSON.
 //
 import {
   groupEvents,
@@ -9,7 +9,59 @@ import {
   slugify,
 } from "./utils.js";  // COPIED from docs/.vitepress/utils.js — keep in sync
 
-const FCM_SEND_URL = "https://fcm.googleapis.com/fcm/send";
+// --- OAuth 2.0 Token Helper for Cloudflare Workers (Web Crypto API) ---
+
+async function getGoogleAccessToken(serviceAccount) {
+  const pemHeader = "-----BEGIN PRIVATE KEY-----";
+  const pemFooter = "-----END PRIVATE KEY-----";
+  const pemContents = serviceAccount.private_key
+    .replace(pemHeader, "")
+    .replace(pemFooter, "")
+    .replace(/\s+/g, "");
+
+  const binaryDer = Uint8Array.from(atob(pemContents), (c) => c.charCodeAt(0));
+  const privateKey = await crypto.subtle.importKey(
+    "pkcs8",
+    binaryDer,
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+
+  const header = { alg: "RS256", typ: "JWT" };
+  const now = Math.floor(Date.now() / 1000);
+  const claimSet = {
+    iss: serviceAccount.client_email,
+    scope: "https://www.googleapis.com/auth/firebase.messaging",
+    aud: "https://oauth2.googleapis.com/token",
+    exp: now + 3600,
+    iat: now,
+  };
+
+  const encodeBase64Url = (str) =>
+    btoa(str).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+
+  const unsignedToken = `${encodeBase64Url(JSON.stringify(header))}.${encodeBase64Url(JSON.stringify(claimSet))}`;
+  const signature = await crypto.subtle.sign(
+    "RSASSA-PKCS1-v1_5",
+    privateKey,
+    new TextEncoder().encode(unsignedToken)
+  );
+
+  const jwt = `${unsignedToken}.${encodeBase64Url(String.fromCharCode(...new Uint8Array(signature)))}`;
+
+  const res = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+      assertion: jwt,
+    }),
+  });
+
+  const data = await res.json();
+  return data.access_token;
+}
 
 // --- Copied verbatim from notify.js (small, self-contained helpers) ---
 
@@ -38,9 +90,20 @@ function tomorrow_str() {
 // --- Main entry point ---
 
 export async function scheduled(env, ctx) {
-  const serverKey = env.FCM_SERVER_KEY;
-  if (!serverKey) {
-    console.log("notifications: FCM_SERVER_KEY not set; nothing to do");
+  if (!env.FCM_SERVICE_ACCOUNT) {
+    console.log("notifications: FCM_SERVICE_ACCOUNT not set; nothing to do");
+    return;
+  }
+
+  let serviceAccount;
+  let accessToken;
+  try {
+    serviceAccount = typeof env.FCM_SERVICE_ACCOUNT === "string" 
+      ? JSON.parse(env.FCM_SERVICE_ACCOUNT) 
+      : env.FCM_SERVICE_ACCOUNT;
+    accessToken = await getGoogleAccessToken(serviceAccount);
+  } catch (e) {
+    console.error("notifications: failed to authenticate with Google:", e);
     return;
   }
 
@@ -58,11 +121,11 @@ export async function scheduled(env, ctx) {
   }
 
   for (const slug of slugs) {
-    await sendNotificationsForSite(env, serverKey, slug);
+    await sendNotificationsForSite(env, serviceAccount.project_id, accessToken, slug);
   }
 }
 
-async function sendNotificationsForSite(env, serverKey, slug) {
+async function sendNotificationsForSite(env, projectId, accessToken, slug) {
   // 2. Fetch the already-processed calendar.json from the deployed Pages site.
   //    The ?time= cache-buster bypasses Cloudflare CDN so the cron sees data
   //    as recent as the latest site build.
@@ -98,8 +161,9 @@ async function sendNotificationsForSite(env, serverKey, slug) {
   }
   const fullSiteUrl = config.dev?.siteurl || siteUrl;
 
-  // 4. Send FCM topic messages — same payload format as notify.js, but via
-  //    FCM HTTP API (to: "/topics/<slug>") instead of firebase-admin (topic: slug)
+  const fcmEndpoint = `https://fcm.googleapis.com/v1/projects/${projectId}/messages:send`;
+
+  // 4. Send FCM topic messages via FCM HTTP v1 API
   for (const title in grouped) {
     let body = "";
     let image = "";
@@ -110,26 +174,29 @@ async function sendNotificationsForSite(env, serverKey, slug) {
     console.log(`notifications: ${slug} ${title} ${body} ${image}`);
 
     const message = {
-      to: `/topics/${slug}`,
-      notification: {
-        title: title + " " + tomorrow_str(),
-        body: body,
-      },
-      webpush: {
-        headers: { TTL: "86400" },
+      message: {
+        topic: slug,
         notification: {
-          icon: image || "/icon-192.png",
-          badge: "/icon-192.png",
-          data: { url: "/#" + slugify(title) },
+          title: title + " " + tomorrow_str(),
+          body: body,
         },
-        fcm_options: { link: fullSiteUrl + "/#" + slugify(title) },
+        webpush: {
+          headers: { TTL: "86400" },
+          notification: {
+            icon: image || "/icon-192.png",
+            badge: "/icon-192.png",
+            data: { url: "/#" + slugify(title) },
+          },
+          fcm_options: { link: fullSiteUrl + "/#" + slugify(title) },
+        },
       },
     };
+
     try {
-      const res = await fetch(FCM_SEND_URL, {
+      const res = await fetch(fcmEndpoint, {
         method: "POST",
         headers: {
-          Authorization: `key=${serverKey}`,
+          Authorization: `Bearer ${accessToken}`,
           "Content-Type": "application/json",
         },
         body: JSON.stringify(message),
