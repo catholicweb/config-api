@@ -313,6 +313,16 @@ export default {
       return addEditor(env, request, slug);
     }
 
+    // POST /sites/:slug/notify — admin or editor gated on-demand notification
+    // trigger to FCM topic /topics/<slug>. Pass-through payload; no calendar read.
+    if (method === 'POST' && segments.length === 3 && segments[2] === 'notify') {
+      const slug = segments[1];
+      if (!validateSlug(slug)) return new Response('Invalid slug', { status: 400 });
+      const auth = await authorizeAdminOrEditor(env, slug, request);
+      if (!auth.ok) return Response.json({ error: auth.error }, { status: auth.status });
+      return notifyTopic(env, request, slug);
+    }
+
     // Editor management (all editor-gated to THIS slug only). These must match
     // BEFORE the generic /sites/:slug/:token handlers below (otherwise 'editors'
     // — a legal filename token — would be treated as a file to write/delete).
@@ -2071,6 +2081,115 @@ async function subscribeFcmToken(ctx, env, request) {
   }
 
   return Response.json({ ok: true }, { status: 200 });
+}
+
+// --- OAuth 2.0 Token Helper for Cloudflare Workers (Web Crypto API) ---
+// Matches notifications.js auth upgrade (FCM HTTP v1 / Service Account).
+async function getGoogleAccessToken(serviceAccount) {
+  const pemHeader = '-----BEGIN PRIVATE KEY-----';
+  const pemFooter = '-----END PRIVATE KEY-----';
+  const pemContents = serviceAccount.private_key
+    .replace(pemHeader, '')
+    .replace(pemFooter, '')
+    .replace(/\s+/g, '');
+
+  const binaryDer = Uint8Array.from(atob(pemContents), (c) => c.charCodeAt(0));
+  const privateKey = await crypto.subtle.importKey(
+    'pkcs8',
+    binaryDer,
+    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+
+  const header = { alg: 'RS256', typ: 'JWT' };
+  const now = Math.floor(Date.now() / 1000);
+  const claimSet = {
+    iss: serviceAccount.client_email,
+    scope: 'https://www.googleapis.com/auth/firebase.messaging',
+    aud: 'https://oauth2.googleapis.com/token',
+    exp: now + 3600,
+    iat: now,
+  };
+
+  const encodeBase64Url = (str) =>
+    btoa(str).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+
+  const unsignedToken = `${encodeBase64Url(JSON.stringify(header))}.${encodeBase64Url(JSON.stringify(claimSet))}`;
+  const signature = await crypto.subtle.sign(
+    'RSASSA-PKCS1-v1_5',
+    privateKey,
+    new TextEncoder().encode(unsignedToken)
+  );
+
+  const jwt = `${unsignedToken}.${encodeBase64Url(String.fromCharCode(...new Uint8Array(signature)))}`;
+
+  const res = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion: jwt,
+    }),
+  });
+
+  const data = await res.json();
+  return data.access_token;
+}
+
+/**
+ * POST /sites/:slug/notify — admin or editor gated on-demand notification
+ * trigger via FCM HTTP v1 (Service Account). Pass-through payload;
+ * forces topic = slug; minimal validation.
+ */
+async function notifyTopic(env, request, slug) {
+  const body = await readJsonBody(request);
+  if (!body.ok) return Response.json({ error: body.error }, { status: 400 });
+  if (typeof body.data !== 'object' || body.data === null || Array.isArray(body.data)) {
+    return Response.json({ error: 'payload must be an object' }, { status: 400 });
+  }
+
+  if (!env.FCM_SERVICE_ACCOUNT) {
+    console.log('notifyTopic: FCM_SERVICE_ACCOUNT not set; skipping send');
+    return Response.json({ ok: true, fcmSent: false }, { status: 200 });
+  }
+
+  let serviceAccount;
+  let accessToken;
+  try {
+    serviceAccount = typeof env.FCM_SERVICE_ACCOUNT === 'string'
+      ? JSON.parse(env.FCM_SERVICE_ACCOUNT)
+      : env.FCM_SERVICE_ACCOUNT;
+    accessToken = await getGoogleAccessToken(serviceAccount);
+  } catch (e) {
+    console.error('notifyTopic: auth failed:', e);
+    return Response.json({ ok: false, error: 'FCM auth failed', detail: String(e) }, { status: 503 });
+  }
+
+  const projectId = serviceAccount.project_id;
+  const fcmEndpoint = `https://fcm.googleapis.com/v1/projects/${projectId}/messages:send`;
+
+  // Force topic and wrap in v1 message shape; allow pass-through notification/webpush
+  const inner = { ...body.data };
+  inner.topic = slug;
+  const message = { message: inner };
+
+  try {
+    const res = await fetch(fcmEndpoint, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(message),
+    });
+    const ok = res.ok;
+    console.log(`notifyTopic: ${slug} -> FCM v1 ${res.status} ${ok ? 'sent' : 'failed'}`);
+    return Response.json({ ok: true, fcmStatus: res.status, fcmSent: ok }, { status: 200 });
+  } catch (e) {
+    console.error('notifyTopic: FCM send failed for', slug, e);
+    return Response.json({ ok: false, error: 'FCM send failed', detail: String(e) }, { status: 502 });
+  }
 }
 
 async function handleHealth(env) {
