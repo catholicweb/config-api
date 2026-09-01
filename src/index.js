@@ -2074,8 +2074,8 @@ async function subscribeFcmToken(ctx, env, request) {
               'Content-Type': 'application/json',
             },
             body: JSON.stringify({
-              to: `/topics/${encodeURIComponent(site)}`,
-              registration_tokens: [token],
+              to: `/topics/${site}`,
+              registration_ids: [token],
             }),
           });
           console.log('subscribeFcmToken: FCM v1 subscribe', site, res.status, res.ok ? 'ok' : 'failed');
