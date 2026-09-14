@@ -546,12 +546,12 @@ describe('applyPatch listAdd operation', () => {
     expect(doc.list).toEqual([{ id: 'a' }, { id: 'b' }]);
   });
 
-  it('listAdd to non-array returns false', () => {
+  it('listAdd to non-array returns array', () => {
     const doc = { list: { not: 'an array' } };
     const result = applyPatch(doc, [
       { op: 'listAdd', path: ['list'], id: 'x', index: 0, value: { id: 'x' } },
     ]);
-    expect(result.skipped).toBe(1);
+    expect(result.skipped).toBe(0);
   });
 
   it('listAdd with scalar value wraps as {id, value}', () => {

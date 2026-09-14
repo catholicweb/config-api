@@ -315,10 +315,25 @@ function applyRemove(root, path) {
 }
 
 function applyListAdd(root, path, id, index, value) {
-  const p = resolveToParent(root, path, false);
+  // create=true: a listAdd's whole point is to add to a list, so a missing
+  // parent object (site hasn't been fully backfilled yet) should be built,
+  // same as applySet does. Id-segments inside the path are still resolved
+  // strictly by resolveToParent regardless of this flag, so this can never
+  // resurrect a concurrently-removed keyed item — only plain object
+  // containers get auto-created.
+  const p = resolveToParent(root, path, true);
   if (!p || p.lastUuid !== undefined) return false;
-  const arr = p.node[p.lastKey];
-  if (!Array.isArray(arr)) return false;
+  let arr = p.node[p.lastKey];
+  if (!Array.isArray(arr)) {
+    // The field is absent, null, or otherwise not yet a real array (e.g. an
+    // older config saved before this list field existed). A listAdd's job is
+    // to add an item to *a* list, so treat "not an array yet" as "empty
+    // list" and initialize it, rather than silently dropping the op — that
+    // silent drop is what makes newly-added items vanish after a save whose
+    // target list was empty/missing/malformed.
+    arr = [];
+    p.node[p.lastKey] = arr;
+  }
   if (!isPlainObject(value)) value = { [ID_KEY]: id, value };
   if (!value[ID_KEY]) value[ID_KEY] = id;
   const pos =
