@@ -112,13 +112,17 @@ function diffNode(base, cur, path, ops) {
   const bArr = Array.isArray(base);
   const cArr = Array.isArray(cur);
   if (bArr || cArr) {
-    diffArray(base ?? [], cur ?? [], path, ops);
+    // Only pass a REAL array through; a non-null, non-array leftover (a
+    // stray string/number from an older, differently-shaped config) must
+    // not reach diffArray as-is — e.g. Object.keys()/for...of on a string
+    // silently iterates its characters as if they were array items.
+    diffArray(bArr ? base : [], cArr ? cur : [], path, ops);
     return;
   }
   const bObj = isPlainObject(base);
   const cObj = isPlainObject(cur);
   if (bObj || cObj) {
-    diffObject(base ?? {}, cur ?? {}, path, ops);
+    diffObject(bObj ? base : {}, cObj ? cur : {}, path, ops);
     return;
   }
   // scalar leaf
@@ -236,11 +240,16 @@ function applyOp(root, op) {
 }
 
 // Resolve every segment before the last, returning the container (`node`) that
-// holds the final segment. `create` controls whether missing string-key path
-// segments are auto-created (`true` for set, so a wholesale set can build the
-// doc as it goes). `{ id }` segments are always resolved strictly: if the
-// item is absent (removed concurrently) the resolve fails and the op becomes a
-// no-op — last-edit-wins, never resurrects.
+// holds the final segment. `create` controls whether a missing OR unusable
+// (null, wrong type — e.g. a legacy field that predates this nesting)
+// intermediate is auto-built (`true` for set/listAdd, so a wholesale
+// set/add can build the doc as it goes, the same way a genuinely absent key
+// would be built). Whether a rebuilt segment becomes `{}` or `[]` is decided
+// by what the *next* segment needs: an `{ id }` segment always addresses an
+// array, so the container just before it must be an array, not an object.
+// `{ id }` segments themselves are always resolved strictly regardless of
+// `create`: if the item is absent (removed concurrently) the resolve fails
+// and the op becomes a no-op — last-edit-wins, never resurrects.
 function resolveToParent(root, path, create) {
   if (!Array.isArray(path) || path.length === 0) return null;
   let node = root;
@@ -253,9 +262,12 @@ function resolveToParent(root, path, create) {
       node = node[idx];
     } else {
       if (!isPlainObject(node)) return null;
-      if (!Object.prototype.hasOwnProperty.call(node, seg)) {
+      const wantArray = isIdSegment(path[i + 1]);
+      const existing = Object.prototype.hasOwnProperty.call(node, seg) ? node[seg] : undefined;
+      const usable = wantArray ? Array.isArray(existing) : isPlainObject(existing);
+      if (!usable) {
         if (!create) return null;
-        node[seg] = {};
+        node[seg] = wantArray ? [] : {};
       }
       node = node[seg];
     }
