@@ -410,6 +410,14 @@ export default {
       }
     }
 
+    // POST /admin/renew-youtube — manually run the nightly YouTube renewal (admin only)
+    if (method === 'POST' && segments.length === 2 && segments[0] === 'admin' && segments[1] === 'renew-youtube') {
+      const admin = await authorizeAdmin(env, request);
+      if (!admin.ok) return Response.json({ error: admin.error }, { status: admin.status });
+      const stats = await renewYouTubeSubscriptions(env);
+      return Response.json({ ok: true, ...stats }, { status: 200 });
+    }
+
     return new Response('Not Found', { status: 404 });
     } catch (err) {
       // Log for the operator; never echo internals (paths, messages, secrets) to
@@ -421,6 +429,8 @@ export default {
   async scheduled(controller, env, ctx) {
     console.log("scheduled: running daily notification cron");
     await sendNotificationsCron(env, ctx);
+    console.log("scheduled: running daily renewYouTubeSubscriptions cron");
+    await renewYouTubeSubscriptions(env);
   },
 };
 
@@ -2365,38 +2375,71 @@ async function resolveYouTubeChannelId(handleOrId, env) {
   return handleOrId;
 }
 
-async function updateSubscribedTo(doc, env) {
+// { force: true } resubscribes every channel in the doc, ignoring subscribedto.
+async function updateSubscribedTo(doc, env, { force = false } = {}) {
   const channels = extractYouTubeChannels(doc);
-  const current = doc?.dev?.subscribedto || [];
+  const current = doc?.dev?.subscribedto;
   const currentSet = new Set(Array.isArray(current) ? current : []);
-  const added = [];
-  for (const ch of channels) {
-    if (!currentSet.has(ch)) {
-      currentSet.add(ch);
-      added.push(ch);
-    }
-  }
-  if (added.length > 0) {
-    const hub = env.PUBSUBHUBBUB_HUB || "https://pubsubhubbub.appspot.com/";
+  const toSubscribe = force ? channels : channels.filter((ch) => !currentSet.has(ch));
+  if (toSubscribe.length === 0) return doc;
+
+  const hub = env.PUBSUBHUBBUB_HUB || "https://pubsubhubbub.appspot.com/";
+  const callback = `https://api.parroquia.app/webhook/youtube?token=${env.WEBHOOK_SECRET || ""}`;
+
+  for (const ch of toSubscribe) {
     try {
-      for (const ch of added) {
-        const resolved = await resolveYouTubeChannelId(ch, env);
-        currentSet.add(resolved); // add also the resolved channel id
-        const topic = `https://www.youtube.com/xml/feeds/videos.xml?channel_id=${resolved}`;
-        await fetch(hub, {
-          method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body: `hub.mode=subscribe&hub.topic=${encodeURIComponent(topic)}&hub.callback=${encodeURIComponent("https://api.parroquia.app/webhook/youtube?token=" + (env.WEBHOOK_SECRET || ""))}`,
-        });
+      const resolved = await resolveYouTubeChannelId(ch, env);
+      if (!String(resolved).startsWith("UC")) {
+        console.log(`youtube: could not resolve "${ch}" to a channel id; skipping`);
+        continue; // not stored, so it is retried on the next save / cron
       }
-      // add new elements only if subscriptions works
-      if (!doc.dev) doc.dev = {};
-      doc.dev.subscribedto = Array.from(currentSet);
-    } catch {
-      // Best-effort subscribe; failure should not block config save.
+      const res = await fetch(hub, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          "hub.mode": "subscribe",
+          "hub.topic": `https://www.youtube.com/xml/feeds/videos.xml?channel_id=${resolved}`,
+          "hub.callback": callback,
+          "hub.verify": "async",
+          "hub.lease_seconds": "432000",
+        }),
+      });
+      if (res.status !== 202 && res.status !== 204) {
+        console.log(`youtube: hub rejected ${resolved}: ${res.status} ${await res.text().catch(() => "")}`);
+        continue; // only record channels the hub accepted
+      }
+      currentSet.add(ch);
+      currentSet.add(resolved);
+    } catch (err) {
+      console.log(`youtube: subscribe failed for ${ch}:`, err);
     }
   }
+  if (!doc.dev) doc.dev = {};
+  doc.dev.subscribedto = Array.from(currentSet);
   return doc;
+}
+
+// Nightly cron: for every site with YouTube channels, force-resubscribe
+// (extends the lease) and trigger a build.
+async function renewYouTubeSubscriptions(env) {
+  const slugs = (await getSlugs(env)).filter((s) => validateSlug(s));
+  const stats = { sites: slugs.length, withYouTube: 0, failed: 0 };
+
+  for (const slug of slugs) {
+    try {
+      const key = `${slug}/config.json`;
+      const obj = await env.CONTENT.get(key);
+      if (!obj) continue;
+      const doc = JSON.parse(await obj.text());
+      await updateSubscribedTo(doc, env, { force: true })
+      stats.withYouTube++;
+    } catch (err) {
+      stats.failed++;
+      console.error(`renewYouTubeSubscriptions: ${slug} failed:`, err);
+    }
+  }
+  console.log("renewYouTubeSubscriptions:", JSON.stringify(stats));
+  return stats;
 }
 
 async function webhookYouTube(ctx, env, request, url) {

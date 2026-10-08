@@ -532,3 +532,37 @@ export async function getAddress(lat, lng, name, zoom = 17) {
 export function getCode(lang) {
   return lang.split(":")[1] || lang.slice(0, 2).toLowerCase();
 }
+
+
+export function oklchToHex(l, c, h) {
+  // Convert OKLCH to OKLAB
+  const hRad = (h * Math.PI) / 180;
+  const a = c * Math.cos(hRad);
+  const b = c * Math.sin(hRad);
+
+  // OKLAB to Linear LMS
+  const l_ = l + 0.3963377774 * a + 0.2158037573 * b;
+  const m_ = l - 0.1055613458 * a - 0.0638541728 * b;
+  const s_ = l - 0.0894841775 * a - 1.291485548 * b;
+
+  const L = l_ ** 3;
+  const M = m_ ** 3;
+  const S = s_ ** 3;
+
+  // Linear LMS to Linear sRGB
+  let r = +4.0767416621 * L - 3.3077115913 * M + 0.2309699292 * S;
+  let g = -1.2684380046 * L + 2.6097574011 * M - 0.3413193965 * S;
+  let bl = -0.0041960863 * L - 0.7034186147 * M + 1.707614701 * S;
+
+  // Linear sRGB to Gamma-encoded sRGB
+  const gamma = (v) =>
+    v <= 0.0031308 ? 12.92 * v : 1.055 * Math.pow(Math.max(0, v), 1 / 2.4) - 0.055;
+
+  // Clamp to [0, 255]
+  const toByte = (v) =>
+    Math.min(255, Math.max(0, Math.round(gamma(v) * 255)));
+
+  return `#${[toByte(r), toByte(g), toByte(bl)]
+    .map((x) => x.toString(16).padStart(2, "0"))
+    .join("")}`;
+}

@@ -79,8 +79,8 @@ enabled = true
 invocation_logs = true
 
 # Daily cron: send FCM topic notifications for tomorrow's calendar events.
-# Runs at 19:00 UTC (= 20:00 CET winter / 21:00 CEST summer). At this hour
+# Runs at 18:00 UTC (= 19:00 CET winter / 20:00 CEST summer). At this hour
 # "tomorrow" is the same date in both UTC and Europe/Madrid, avoiding
 # timezone-boundary edge cases in the date comparison.
 [[triggers]]
-crons = ["0 19 * * *"]
+crons = ["0 18 * * *"]
