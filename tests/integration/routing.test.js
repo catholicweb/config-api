@@ -121,3 +121,51 @@ describe('routing — valid slug passes decode+validate', () => {
     expect(res.status).not.toBe(400);
   });
 });
+
+describe('routing — YouTube webhook and admin renew (regression: were unreachable)', () => {
+  it('GET /webhook/youtube echoes hub.challenge through the real router', async () => {
+    const r2 = new MockR2();
+    const env = await makeTestEnv(r2);
+    env.WEBHOOK_SECRET = 'sec';
+    const res = await dispatch(env, makeCtx(), 'GET', '/webhook/youtube?token=sec&hub.challenge=abc123');
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe('abc123');
+  });
+
+  it('GET /webhook/youtube with a bad token is 403, not 404', async () => {
+    const r2 = new MockR2();
+    const env = await makeTestEnv(r2);
+    env.WEBHOOK_SECRET = 'sec';
+    const res = await dispatch(env, makeCtx(), 'GET', '/webhook/youtube?token=nope&hub.challenge=x');
+    expect(res.status).toBe(403);
+  });
+
+  it('POST /webhook/youtube with ?slug= resolves the slug', async () => {
+    const r2 = new MockR2();
+    const env = await makeTestEnv(r2);
+    env.WEBHOOK_SECRET = 'sec';
+    const res = await dispatch(env, makeCtx(), 'POST', '/webhook/youtube?token=sec&slug=my-site', { body: '<feed/>' });
+    expect(res.status).toBe(200);
+    expect((await res.json()).slug).toBe('my-site');
+  });
+
+  it('POST /admin/renew-youtube requires admin auth (401 without a token)', async () => {
+    const r2 = new MockR2();
+    const env = await makeTestEnv(r2, 'admin-secret');
+    const res = await dispatch(env, makeCtx(), 'POST', '/admin/renew-youtube');
+    expect(res.status).toBe(401);
+  });
+
+  it('POST /admin/renew-youtube with the admin token runs and returns stats', async () => {
+    const r2 = new MockR2();
+    const env = await makeTestEnv(r2, 'admin-secret');
+    const res = await dispatch(env, makeCtx(), 'POST', '/admin/renew-youtube', {
+      headers: { Authorization: 'Bearer admin-secret' },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    expect(body).toHaveProperty('sites');
+    expect(body).toHaveProperty('accepted');
+  });
+});

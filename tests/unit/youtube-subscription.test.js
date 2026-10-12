@@ -1,5 +1,5 @@
 // Unit tests for opus-youtube-subscriptions (idea: test-youtube)
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { extractYouTubeChannels, updateSubscribedTo, webhookYouTube, resolveYouTubeChannelId } from '../../src/index.js';
 
 describe('extractYouTubeChannels', () => {
@@ -134,5 +134,82 @@ describe('webhookYouTube', () => {
     const req = new Request(url.toString(), { method: 'POST', body: '{"slug":"47herri"}' });
     const res = await webhookYouTube({ waitUntil: () => {} }, { WEBHOOK_SECRET: 'good' }, req, url);
     expect(res.status).toBe(200);
+  });
+});
+
+describe('extractYouTubeChannels — @handle in every social shape', () => {
+  it('extracts @handle from object url fields', () => {
+    const doc = { info: { social: [{ url: 'https://www.youtube.com/@47herri' }] } };
+    expect(extractYouTubeChannels(doc)).toEqual(['47herri']);
+  });
+
+  it('extracts @handle from object-valued social', () => {
+    const doc = { info: { social: { yt: 'https://youtube.com/@47herri' } } };
+    expect(extractYouTubeChannels(doc)).toEqual(['47herri']);
+  });
+
+  it('extracts url from nested object values', () => {
+    const doc = { info: { social: { yt: { url: 'https://youtube.com/channel/UCnested' } } } };
+    expect(extractYouTubeChannels(doc)).toEqual(['UCnested']);
+  });
+});
+
+describe('updateSubscribedTo — callback, force and report', () => {
+  const env = { PUBSUBHUBBUB_HUB: 'https://hub.example/', WEBHOOK_SECRET: 'sec' };
+  const doc = () => ({ info: { social: ['https://youtube.com/channel/UCabc'] } });
+
+  it('puts the slug in the callback URL', async () => {
+    const calls = [];
+    global.fetch = async (_u, init) => { calls.push(init.body); return { status: 202, text: async () => '' }; };
+    await updateSubscribedTo(doc(), env, { slug: 'my-site' });
+    delete global.fetch;
+    const cb = new URLSearchParams(calls[0]).get('hub.callback');
+    expect(cb).toBe('https://api.parroquia.app/webhook/youtube?token=sec&slug=my-site');
+  });
+
+  it('omits slug for invalid slugs', async () => {
+    const calls = [];
+    global.fetch = async (_u, init) => { calls.push(init.body); return { status: 202, text: async () => '' }; };
+    await updateSubscribedTo(doc(), env, { slug: 'bad/slug' });
+    delete global.fetch;
+    expect(new URLSearchParams(calls[0]).get('hub.callback')).not.toContain('slug=');
+  });
+
+  it('force resubscribes channels already in subscribedto', async () => {
+    const fetchMock = vi.fn(async () => ({ status: 202, text: async () => '' }));
+    global.fetch = fetchMock;
+    const d = doc();
+    d.dev = { subscribedto: ['UCabc'] };
+    await updateSubscribedTo(d, env);
+    expect(fetchMock).toHaveBeenCalledTimes(0);
+    await updateSubscribedTo(d, env, { force: true });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    delete global.fetch;
+  });
+
+  it('reports accepted and failed counts', async () => {
+    global.fetch = async () => ({ status: 500, text: async () => 'boom' });
+    const report = {};
+    const d = await updateSubscribedTo(doc(), env, { report });
+    delete global.fetch;
+    expect(report).toEqual({ channels: 1, accepted: 0, failed: 1 });
+    expect(d.dev.subscribedto).toEqual([]);
+  });
+});
+
+describe('webhookYouTube — slug from callback query', () => {
+  it('resolves slug from ?slug= on an Atom payload', async () => {
+    const url = new URL('https://example.com/webhook/youtube?token=s&slug=my-site');
+    const req = new Request(url.toString(), { method: 'POST', body: '<feed xmlns="http://www.w3.org/2005/Atom"></feed>' });
+    const res = await webhookYouTube({ waitUntil: () => {} }, { WEBHOOK_SECRET: 's' }, req, url);
+    expect(res.status).toBe(200);
+    expect((await res.json()).slug).toBe('my-site');
+  });
+
+  it('rejects an invalid ?slug=', async () => {
+    const url = new URL('https://example.com/webhook/youtube?token=s&slug=Bad_Slug');
+    const req = new Request(url.toString(), { method: 'POST', body: '<feed/>' });
+    const res = await webhookYouTube({ waitUntil: () => {} }, { WEBHOOK_SECRET: 's' }, req, url);
+    expect(res.status).toBe(400);
   });
 });

@@ -57,6 +57,14 @@ workers_dev = false
 #                                                   # daily cron (src/notifications.js) to send topic
 #                                                   # messages for tomorrow's calendar events.
 #
+# Secrets required for YouTube subscriptions (PubSubHubbub):
+#
+#   npx wrangler secret put WEBHOOK_SECRET          # shared token in the callback URL
+#                                                   # (/webhook/youtube?token=...). Unset => 403 on hub verification.
+#   npx wrangler secret put YOUTUBE_API_KEY         # resolves @handle links to UC... channel ids.
+#                                                   # Without it @handle channels are skipped.
+#   (optional) PUBSUBHUBBUB_HUB                     # defaults to https://pubsubhubbub.appspot.com/
+#
 # For local dev, put them in .dev.vars instead (gitignored).
 
 # Non-secret: where the emailed magic link points (the editor magic-link landing
@@ -78,9 +86,12 @@ bucket_name = "parroquia"
 enabled = true
 invocation_logs = true
 
-# Daily cron: send FCM topic notifications for tomorrow's calendar events.
+# Daily cron: (1) send FCM topic notifications for tomorrow's calendar events,
+# (2) renew every site's YouTube PubSubHubbub subscriptions.
+# NOTE: wrangler expects a single [triggers] table; `[[triggers]]` (array of tables)
+# is not the documented form and may leave the cron unregistered.
 # Runs at 18:00 UTC (= 19:00 CET winter / 20:00 CEST summer). At this hour
 # "tomorrow" is the same date in both UTC and Europe/Madrid, avoiding
 # timezone-boundary edge cases in the date comparison.
-[[triggers]]
+[triggers]
 crons = ["0 18 * * *"]
