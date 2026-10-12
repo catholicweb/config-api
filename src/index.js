@@ -216,6 +216,25 @@ export default {
       return requestMagicLink(env, request);
     }
 
+    // POST / GET /webhook/youtube — PubSubHubbub webhook (secret token protected).
+    // NOTE: must be matched BEFORE the `segments[0] !== 'sites'` guard below,
+    // otherwise it is unreachable (hub verification GETs would 404 and the
+    // subscription would never be confirmed).
+    if (segments.length === 2 && segments[0] === 'webhook' && segments[1] === 'youtube') {
+      if (method === 'POST' || method === 'GET') {
+        return webhookYouTube(ctx, env, request, url);
+      }
+    }
+
+    // POST /admin/renew-youtube — manually run the nightly YouTube renewal (admin only).
+    // Same ordering constraint as the webhook above.
+    if (method === 'POST' && segments.length === 2 && segments[0] === 'admin' && segments[1] === 'renew-youtube') {
+      const admin = await authorizeAdmin(env, request);
+      if (!admin.ok) return Response.json({ error: admin.error }, { status: admin.status });
+      const stats = await renewYouTubeSubscriptions(env);
+      return Response.json({ ok: true, ...stats }, { status: 200 });
+    }
+
     if (segments[0] !== 'sites') {
       return new Response('Not Found', { status: 404 });
     }
@@ -403,21 +422,6 @@ export default {
       return deleteFile(env, slug, token);
     }
 
-    // POST / GET /webhook/youtube — PubSubHubbub webhook (secret token protected)
-    if (segments.length === 2 && segments[0] === 'webhook' && segments[1] === 'youtube') {
-      if (method === 'POST' || method === 'GET') {
-        return webhookYouTube(ctx, env, request, url);
-      }
-    }
-
-    // POST /admin/renew-youtube — manually run the nightly YouTube renewal (admin only)
-    if (method === 'POST' && segments.length === 2 && segments[0] === 'admin' && segments[1] === 'renew-youtube') {
-      const admin = await authorizeAdmin(env, request);
-      if (!admin.ok) return Response.json({ error: admin.error }, { status: admin.status });
-      const stats = await renewYouTubeSubscriptions(env);
-      return Response.json({ ok: true, ...stats }, { status: 200 });
-    }
-
     return new Response('Not Found', { status: 404 });
     } catch (err) {
       // Log for the operator; never echo internals (paths, messages, secrets) to
@@ -427,10 +431,19 @@ export default {
     }
   },
   async scheduled(controller, env, ctx) {
+    // Run each job independently so a failure in one never skips the other.
     console.log("scheduled: running daily notification cron");
-    await sendNotificationsCron(env, ctx);
+    try {
+      await sendNotificationsCron(env, ctx);
+    } catch (err) {
+      console.error("scheduled: notification cron failed:", err);
+    }
     console.log("scheduled: running daily renewYouTubeSubscriptions cron");
-    await renewYouTubeSubscriptions(env);
+    try {
+      await renewYouTubeSubscriptions(env);
+    } catch (err) {
+      console.error("scheduled: renewYouTubeSubscriptions failed:", err);
+    }
   },
 };
 
@@ -2221,7 +2234,7 @@ async function putFile(ctx, env, slug, token, request) {
     } catch {
       return Response.json({ ok: false, error: 'Invalid JSON for config.json' }, { status: 400 });
     }
-    doc = await updateSubscribedTo(doc, env);
+    doc = await updateSubscribedTo(doc, env, { slug });
     bodyToWrite = JSON.stringify(doc, null, 2) + '\n';
   }
   await env.CONTENT.put(key, bodyToWrite, {
@@ -2275,7 +2288,7 @@ async function patchConfigFile(ctx, env, slug, request) {
   }
   // applyPatch mutates `doc` in place (only allocation is parse/stringify).
   let { data, skipped } = applyPatch(doc, body.ops);
-  data = await updateSubscribedTo(data, env); // opus-youtube: sync subscriptions
+  data = await updateSubscribedTo(data, env, { slug }); // opus-youtube: sync subscriptions
   const text = JSON.stringify(data, null, 2) + '\n';
   await env.CONTENT.put(key, text, {
     httpMetadata: { contentType: 'application/json; charset=utf-8', cacheControl: CACHE_REVALIDATE },
@@ -2334,27 +2347,32 @@ async function deleteFile(env, slug, token) {
 
 // --- opus-youtube-subscriptions helpers ---
 
+// One matcher for every shape `social` can take (string, object url field,
+// object value) so @handle links work everywhere.
+const YT_CHANNEL_RE = /(?:youtube\.com\/channel\/|youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/c\/|youtube\.com\/@)([A-Za-z0-9_-]+)/;
+
+function matchYouTubeChannel(value) {
+  const m = String(value || "").match(YT_CHANNEL_RE);
+  return m ? m[1] : null;
+}
+
 function extractYouTubeChannels(doc) {
   const channels = [];
   const social = doc?.info?.social || doc?.config?.info?.social || doc?.info || {};
+  const push = (v) => {
+    const ch = matchYouTubeChannel(v);
+    if (ch) channels.push(ch);
+  };
   if (Array.isArray(social)) {
     for (const item of social) {
-      if (typeof item === "string") {
-        const m = item.match(/(?:youtube\.com\/channel\/|youtu\.be\/|youtube\.com\/c\/|youtube\.com\/@)([A-Za-z0-9_-]+)/);
-        if (m) channels.push(m[1]);
-      } else if (item && typeof item === "object") {
-        const url = item.url || item.link || item.youtube || "";
-        const m = String(url).match(/(?:youtube\.com\/channel\/|youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/c\/)([A-Za-z0-9_-]+)/);
-        if (m) channels.push(m[1]);
-      }
+      if (typeof item === "string") push(item);
+      else if (item && typeof item === "object") push(item.url || item.link || item.youtube);
     }
   } else if (typeof social === "object" && social !== null) {
     for (const key in social) {
       const val = social[key];
-      if (typeof val === "string") {
-        const m = val.match(/(?:youtube\.com\/channel\/|youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/c\/)([A-Za-z0-9_-]+)/);
-        if (m) channels.push(m[1]);
-      }
+      if (typeof val === "string") push(val);
+      else if (val && typeof val === "object") push(val.url || val.link || val.youtube);
     }
   }
   return [...new Set(channels)];
@@ -2375,22 +2393,30 @@ async function resolveYouTubeChannelId(handleOrId, env) {
   return handleOrId;
 }
 
-// { force: true } resubscribes every channel in the doc, ignoring subscribedto.
-async function updateSubscribedTo(doc, env, { force = false } = {}) {
+// Subscribe the doc's YouTube channels to the PubSubHubbub hub.
+//   force  — resubscribe every channel, ignoring dev.subscribedto (lease renewal).
+//   slug   — added to the callback URL so the webhook knows which site to build
+//            (YouTube's Atom payload contains no slug of its own).
+//   report — optional object filled with { channels, accepted, failed } so the
+//            nightly cron can report real numbers.
+async function updateSubscribedTo(doc, env, { force = false, slug = null, report = null } = {}) {
   const channels = extractYouTubeChannels(doc);
   const current = doc?.dev?.subscribedto;
   const currentSet = new Set(Array.isArray(current) ? current : []);
   const toSubscribe = force ? channels : channels.filter((ch) => !currentSet.has(ch));
+  if (report) Object.assign(report, { channels: channels.length, accepted: 0, failed: 0 });
   if (toSubscribe.length === 0) return doc;
 
   const hub = env.PUBSUBHUBBUB_HUB || "https://pubsubhubbub.appspot.com/";
-  const callback = `https://api.parroquia.app/webhook/youtube?token=${env.WEBHOOK_SECRET || ""}`;
+  let callback = `https://api.parroquia.app/webhook/youtube?token=${env.WEBHOOK_SECRET || ""}`;
+  if (slug && validateSlug(slug)) callback += `&slug=${slug}`;
 
   for (const ch of toSubscribe) {
     try {
       const resolved = await resolveYouTubeChannelId(ch, env);
       if (!String(resolved).startsWith("UC")) {
-        console.log(`youtube: could not resolve "${ch}" to a channel id; skipping`);
+        console.log(`youtube: could not resolve "${ch}" to a channel id (is YOUTUBE_API_KEY set?); skipping`);
+        if (report) report.failed++;
         continue; // not stored, so it is retried on the next save / cron
       }
       const res = await fetch(hub, {
@@ -2406,12 +2432,15 @@ async function updateSubscribedTo(doc, env, { force = false } = {}) {
       });
       if (res.status !== 202 && res.status !== 204) {
         console.log(`youtube: hub rejected ${resolved}: ${res.status} ${await res.text().catch(() => "")}`);
+        if (report) report.failed++;
         continue; // only record channels the hub accepted
       }
       currentSet.add(ch);
       currentSet.add(resolved);
+      if (report) report.accepted++;
     } catch (err) {
       console.log(`youtube: subscribe failed for ${ch}:`, err);
+      if (report) report.failed++;
     }
   }
   if (!doc.dev) doc.dev = {};
@@ -2420,10 +2449,12 @@ async function updateSubscribedTo(doc, env, { force = false } = {}) {
 }
 
 // Nightly cron: for every site with YouTube channels, force-resubscribe
-// (extends the lease) and trigger a build.
+// (extends the hub lease). The updated doc is intentionally NOT written back:
+// a read-modify-write here could clobber a concurrent editor save, and the
+// lease lives at the hub, not in config.json.
 async function renewYouTubeSubscriptions(env) {
   const slugs = (await getSlugs(env)).filter((s) => validateSlug(s));
-  const stats = { sites: slugs.length, withYouTube: 0, failed: 0 };
+  const stats = { sites: slugs.length, withYouTube: 0, channels: 0, accepted: 0, failed: 0 };
 
   for (const slug of slugs) {
     try {
@@ -2431,8 +2462,12 @@ async function renewYouTubeSubscriptions(env) {
       const obj = await env.CONTENT.get(key);
       if (!obj) continue;
       const doc = JSON.parse(await obj.text());
-      await updateSubscribedTo(doc, env, { force: true })
-      stats.withYouTube++;
+      const report = {};
+      await updateSubscribedTo(doc, env, { force: true, slug, report });
+      if (report.channels > 0) stats.withYouTube++;
+      stats.channels += report.channels;
+      stats.accepted += report.accepted;
+      stats.failed += report.failed;
     } catch (err) {
       stats.failed++;
       console.error(`renewYouTubeSubscriptions: ${slug} failed:`, err);
@@ -2461,9 +2496,13 @@ async function webhookYouTube(ctx, env, request, url) {
   } catch {
     return new Response("Bad Request", { status: 400 });
   }
-  let slug = null;
-  const slugMatch = payload.match(/"slug"\s*[:=]\s*"([^"]+)"/);
-  if (slugMatch) slug = slugMatch[1];
+  // Preferred: the slug we put in the callback URL when subscribing.
+  let slug = url.searchParams.get("slug");
+  // Fallbacks (manual/legacy callers): slug in the payload or a /sites/<slug> URL.
+  if (!slug) {
+    const slugMatch = payload.match(/"slug"\s*[:=]\s*"([^"]+)"/);
+    if (slugMatch) slug = slugMatch[1];
+  }
   if (!slug) {
     const m = payload.match(/https?:\/\/[^/]+\/sites\/([a-zA-Z0-9_-]+)/);
     if (m) slug = m[1];
