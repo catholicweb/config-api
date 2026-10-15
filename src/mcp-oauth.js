@@ -133,8 +133,34 @@ export async function authorizeGet(env, request) {
   const q = new URL(request.url).searchParams;
   const client = await verify(env, q.get('client_id'), 'client');
   if (!client) return page('Error', '<h1>Cliente no válido</h1><p>El cliente MCP no está registrado.</p>', 400);
-  const ru = q.get('redirect_uri') || (client.r.length === 1 ? client.r[0] : null);
-  if (!ru || !client.r.includes(ru)) return page('Error', '<h1>redirect_uri no válida</h1><p>No coincide con la registrada.</p>', 400);
+
+  const requestedRu = q.get('redirect_uri');
+  
+  // Helper to normalize URLs (ignore trailing slash differences)
+  const norm = (u) => {
+    try {
+      const parsed = new URL(u);
+      return parsed.origin + parsed.pathname.replace(/\/$/, '') + parsed.search;
+    } catch {
+      return u;
+    }
+  };
+
+  // Find matching registered URI flexibly
+  let ru = null;
+  if (requestedRu) {
+    const matched = client.r.find(r => r === requestedRu || norm(r) === norm(requestedRu));
+    ru = matched || requestedRu; // fallback to requested if trusted domain structure
+  } else if (client.r.length === 1) {
+    ru = client.r[0];
+  }
+
+  // Validate against registered list with normalization
+  const isValid = ru && client.r.some(r => r === ru || norm(r) === norm(ru));
+  if (!isValid) {
+    return page('Error', '<h1>redirect_uri no válida</h1><p>No coincide con la registrada.</p>', 400);
+  }
+
   const redirectErr = (e, d) => redirectTo(ru, { error: e, error_description: d, state: q.get('state') });
   if (q.get('response_type') !== 'code') return redirectErr('unsupported_response_type', 'only response_type=code');
   if (!q.get('code_challenge') || (q.get('code_challenge_method') || 'plain') !== 'S256') {

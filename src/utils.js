@@ -382,6 +382,7 @@ function tr(str, lang = "Español:es") {
 export function slugify(str) {
   if (!str) return "";
 
+  if (Array.isArray(str)) str = str[0]
   const slug = str
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
