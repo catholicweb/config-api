@@ -108,8 +108,8 @@ export async function register(env, request) {
   const body = await readJsonBody(request);
   if (!body.ok) return oauthError('invalid_client_metadata', body.error);
   const uris = body.data.redirect_uris;
-  if (!Array.isArray(uris) || uris.length === 0 || uris.length > 5 || !uris.every((u) => typeof u === 'string' && okRedirectUri(u))) {
-    return oauthError('invalid_redirect_uri', 'redirect_uris must be 1-5 https (or loopback http / app-scheme) URIs without fragments');
+  if (!Array.isArray(uris) || uris.length === 0 || uris.length > 10 || !uris.every((u) => typeof u === 'string' && okRedirectUri(u))) {
+    return oauthError('invalid_redirect_uri', 'redirect_uris must be 1-10 https (or loopback http / app-scheme) URIs without fragments');
   }
   const name = typeof body.data.client_name === 'string' ? body.data.client_name.trim().slice(0, 80) : '';
   
