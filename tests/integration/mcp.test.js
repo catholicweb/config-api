@@ -112,7 +112,7 @@ describe('MCP tools', () => {
 
   it('lists tools and sites', async () => {
     const tools = (await (await rpc(token, 'tools/list')).json()).result.tools.map((t) => t.name);
-    expect(tools).toEqual(['list_sites', 'get_schema', 'get_config', 'validate_config', 'patch_config']);
+    expect(tools).toEqual(['list_sites', 'get_schema', 'get_config', 'validate_config', 'patch_config', 'list_files', 'read_file', 'write_file', 'delete_file', 'list_editors', 'add_editor', 'change_editor_email', 'remove_editor', 'create_site']);
     expect(JSON.parse(txt(await call(token, 'list_sites', {}))).sites[0].slug).toBe('abc');
   });
 
