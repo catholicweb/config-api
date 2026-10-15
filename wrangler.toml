@@ -1,6 +1,6 @@
 # https://developers.cloudflare.com/workers/wrangler/configuration/
 name = "parroquia-config-api"
-main = "src/index.js"
+main = "src/worker.js"
 compatibility_date = "2026-07-14"
 workers_dev = false
 
