@@ -103,6 +103,7 @@ function okRedirectUri(u) {
   return true; // https: and custom app schemes (cursor://, vscode://, ...)
 }
 
+// ---- dynamic client registration (state-backed) ------------------------------
 export async function register(env, request) {
   const body = await readJsonBody(request);
   if (!body.ok) return oauthError('invalid_client_metadata', body.error);
@@ -111,11 +112,31 @@ export async function register(env, request) {
     return oauthError('invalid_redirect_uri', 'redirect_uris must be 1-5 https (or loopback http / app-scheme) URIs without fragments');
   }
   const name = typeof body.data.client_name === 'string' ? body.data.client_name.trim().slice(0, 80) : '';
-  const clientId = await sign(env, { t: 'client', n: name || 'Cliente MCP', r: uris });
-  if (!clientId) return oauthError('server_error', 'AUTH_KEY not configured', 503);
+  
+  // 1. Generate a clean, dot-free client ID
+  const clientId = generateToken();
+  const state = await readAuthState(env);
+  if (!state) return oauthError('server_error', 'auth state unavailable', 503);
+
+  // 2. Save client details in state (persisted alongside magic links & oauth codes)
+  state.clients = state.clients || {};
+  state.clients[clientId] = {
+    n: name || 'Cliente MCP',
+    r: uris,
+    exp: Date.now() + (365 * 24 * 60 * 60 * 1000) // 1 year expiry or remove exp if permanent
+  };
+
+  const w = await writeAuthState(env, state);
+  if (!w.ok) return oauthError('server_error', w.error, 503);
+
+  // 3. Return clean response with no dots in client_id
   return json({
-    client_id: clientId, client_name: name || 'Cliente MCP', redirect_uris: uris,
-    token_endpoint_auth_method: 'none', grant_types: ['authorization_code'], response_types: ['code'],
+    client_id: clientId, 
+    client_name: name || 'Cliente MCP', 
+    redirect_uris: uris,
+    token_endpoint_auth_method: 'none', 
+    grant_types: ['authorization_code'], 
+    response_types: ['code'],
   }, 201);
 }
 
@@ -129,14 +150,20 @@ async function readForm(request) {
   try { return Object.fromEntries(new URLSearchParams(await request.text())); } catch { return {}; }
 }
 
+
+// ---- authorize: email form -> magic link -> consent -> code ---------------
 export async function authorizeGet(env, request) {
   const q = new URL(request.url).searchParams;
-  const client = await verify(env, q.get('client_id'), 'client');
+  const clientIdParam = q.get('client_id');
+  
+  const state = await readAuthState(env);
+  const client = state && state.clients && state.clients[clientIdParam];
+  
   if (!client) return page('Error', '<h1>Cliente no válido</h1><p>El cliente MCP no está registrado.</p>', 400);
-
+  
   const requestedRu = q.get('redirect_uri');
   
-  // Helper to normalize URLs (ignore trailing slash differences)
+  // Normalize URLs to tolerate trailing slash differences
   const norm = (u) => {
     try {
       const parsed = new URL(u);
@@ -146,16 +173,14 @@ export async function authorizeGet(env, request) {
     }
   };
 
-  // Find matching registered URI flexibly
   let ru = null;
   if (requestedRu) {
     const matched = client.r.find(r => r === requestedRu || norm(r) === norm(requestedRu));
-    ru = matched || requestedRu; // fallback to requested if trusted domain structure
+    ru = matched || requestedRu;
   } else if (client.r.length === 1) {
     ru = client.r[0];
   }
 
-  // Validate against registered list with normalization
   const isValid = ru && client.r.some(r => r === ru || norm(r) === norm(ru));
   if (!isValid) {
     return page('Error', '<h1>redirect_uri no válida</h1><p>No coincide con la registrada.</p>', 400);
@@ -166,8 +191,9 @@ export async function authorizeGet(env, request) {
   if (!q.get('code_challenge') || (q.get('code_challenge_method') || 'plain') !== 'S256') {
     return redirectErr('invalid_request', 'PKCE with code_challenge_method=S256 is required');
   }
+  
   const req = await sign(env, {
-    t: 'req', cid: client.n, client_id: q.get('client_id'), ru, cc: q.get('code_challenge'), st: q.get('state') || null,
+    t: 'req', cid: client.n, client_id: clientIdParam, ru, cc: q.get('code_challenge'), st: q.get('state') || null,
     exp: Date.now() + REQ_TTL_MS,
   });
   return page('Conectar con Parroquia.app', emailForm(client.n, req));
