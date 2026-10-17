@@ -24,6 +24,13 @@ no NEW schema errors (errors already present in legacy configs do not block unre
 `id`s are filled server-side. Only sections defined in the schema are editable (e.g. `dev` is not).
 Writes are forwarded to the existing PATCH handler, so auto-build and YouTube sync behave as for the editor.
 
+### Field guidance (`help`)
+A field in `_pages.yml` can carry a long-form `help` text. The editor shows it as an (i) tooltip for humans, and
+the schema generator appends it to that field's JSON Schema `description`, so the AI reads the same text via
+`get_schema`. `get_schema` outlines big nodes: each outlined property/variant shows the first 200 characters of its
+description (marked `[truncated]` when cut); drill into the field with `path` for the full text. Keep the
+important part of a `help` text at the start.
+
 ## Layout
 `src/worker.js` (entrypoint, wraps `src/index.js`) · `src/mcp.js` (JSON-RPC + tools) · `src/mcp-oauth.js` · `src/mcp-schema.js` (validator, no dependencies).
 Not yet: image upload, resources/prompts, refresh tokens (tokens do not expire, like editor tokens).
