@@ -14,6 +14,8 @@ let schemaMemo = { url: null, at: 0, schema: null };
 
 export const INSTRUCTIONS = `Edit parish website config.json files.
 Workflow: list_sites -> get_schema (overview, then drill into a section) -> get_config (use \`path\`) -> validate_config -> patch_config.
+SAVING: only patch_config saves. validate_config is a dry run that changes nothing, so an edit is NOT done until patch_config has succeeded with the ops. After saving, re-read the changed part with get_config to confirm it. Never tell the user a change was made before patch_config returned saved:true.
+Field \`description\`s in the schema contain usage guidance (what values mean, how fields combine, what is generated from what): read the description of every field you are about to change; if an outline shows it as [truncated], drill into that field with get_schema \`path\` first.
 Rules: rich-text fields are Markdown, not HTML. Lists of objects are keyed by "id" (the server fills missing ids on new items). Images/files: list_files, read_file, write_file (use a NEW unique file name), delete_file; then reference the file URL via patch_config. Site editors: list_editors, add_editor, change_editor_email, remove_editor. New sites: create_site. Edits go live immediately, so validate first and keep changes minimal.`;
 
 const OPS_HELP = `ops is an array of: {"op":"set","path":[...],"value":...} | {"op":"remove","path":[...]} | {"op":"listAdd","path":[...list path],"value":{...},"index"?:n} | {"op":"listReorder","path":[...list path],"ids":[...]}. A path is an array of field names; address a list item with {"id":"<item id>"}, e.g. ["pages","list",{"id":"abc"},"title"]. The first path segment must be a config section (see get_schema).`;
@@ -27,7 +29,7 @@ const CORE_TOOLS = [
   },
   {
     name: 'get_schema',
-    description: 'Describe the config.json structure (generated from the editor schema). Without arguments returns an overview of the sections. Use `section` (e.g. "pages") and optionally a dotted `path` (e.g. "list.sections.gallery") to drill down; large nodes are outlined unless full=true.',
+    description: 'Describe the config.json structure (generated from the editor schema). Without arguments returns an overview of the sections. Use `section` (e.g. "pages") and optionally a dotted `path` (e.g. "list.sections.gallery") to drill down; large nodes are outlined unless full=true. Field descriptions hold usage guidance: read them before editing a field.',
     inputSchema: { type: 'object', properties: { section: { type: 'string' }, path: { type: 'string' }, full: { type: 'boolean' } } },
     annotations: { readOnlyHint: true },
   },
@@ -39,13 +41,13 @@ const CORE_TOOLS = [
   },
   {
     name: 'validate_config',
-    description: `Dry run: apply ops to the current config in memory and validate against the schema. Nothing is saved. ${OPS_HELP}`,
+    description: `Dry run: apply ops to the current config in memory and validate against the schema. NOTHING IS SAVED: call patch_config with the same ops afterwards to actually apply the change. ${OPS_HELP}`,
     inputSchema: { type: 'object', properties: { slug: { type: 'string' }, ops: { type: 'array', items: { type: 'object' } } }, required: ['slug', 'ops'] },
     annotations: { readOnlyHint: true },
   },
   {
     name: 'patch_config',
-    description: `Validate and save changes to a site's config.json. Changes go LIVE immediately (a site rebuild is triggered). Rejected if the ops introduce schema errors. ${OPS_HELP}`,
+    description: `Validate and save changes to a site's config.json. This is the ONLY tool that saves: an edit is not done until this returns saved:true. Changes go LIVE immediately (a site rebuild is triggered). Rejected if the ops introduce schema errors. ${OPS_HELP}`,
     inputSchema: { type: 'object', properties: { slug: { type: 'string' }, ops: { type: 'array', items: { type: 'object' } } }, required: ['slug', 'ops'] },
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
   },

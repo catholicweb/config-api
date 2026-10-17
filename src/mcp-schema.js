@@ -167,6 +167,12 @@ export function drill(schema, path) {
   return { node };
 }
 
+// Field descriptions can be long (the editor's `help` text is appended to them),
+// so an outline carries only the first BRIEF chars of each one. The node being
+// outlined keeps its full description; drill into a field to read the rest.
+const BRIEF = 200;
+const brief = (d) => (typeof d === 'string' && d.length > BRIEF ? `${d.slice(0, BRIEF).trimEnd()}… [truncated]` : d);
+
 /** One-level summary of a (possibly huge) schema node. */
 export function outline(node) {
   const inner = isArrayNode(node) && node.items ? node.items : node;
@@ -174,14 +180,14 @@ export function outline(node) {
   if (isArrayNode(node)) out.note = 'list of items; each item has the shape below';
   if (inner.properties) {
     out.properties = Object.fromEntries(
-      Object.entries(inner.properties).map(([k, v]) => [k, { type: v.type, title: v.title }]),
+      Object.entries(inner.properties).map(([k, v]) => [k, { type: v.type, title: v.title, description: brief(v.description) }]),
     );
     if (inner.required) out.required = inner.required;
   }
   const variants = (inner.allOf || []).filter((a) => a.if).map((a) => ({
-    name: a.if.properties.type.const, title: a.then?.title,
+    name: a.if.properties.type.const, title: a.then?.title, description: brief(a.then?.description),
   }));
   if (variants.length) out.variants = variants;
-  out.hint = 'Call get_schema again with a deeper `path` (use a variant name to see one block type), or pass full=true.';
+  out.hint = 'Call get_schema again with a deeper `path` (use a variant name to see one block type), or pass full=true. Descriptions ending in [truncated] are cut short: read the full text of a field (it may explain how to use it) before editing it.';
   return out;
 }
