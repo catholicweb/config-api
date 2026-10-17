@@ -5,6 +5,7 @@
 import { applyPatch } from './patch.js';
 import { readAuthState, sha256Hex, bearerToken } from './index.js';
 import { validate, newErrors, resolveNode, fillIds, drill, outline, isObj } from './mcp-schema.js';
+import { EXTRA_TOOLS, callExtraTool } from './mcp-tools.js';
 
 const PROTOCOLS = ['2025-06-18', '2025-03-26', '2024-11-05'];
 const DEFAULT_SCHEMA_URL = 'https://editor.parroquia.app/config.schema.json';
@@ -15,11 +16,11 @@ export const INSTRUCTIONS = `Edit parish website config.json files.
 Workflow: list_sites -> get_schema (overview, then drill into a section) -> get_config (use \`path\`) -> validate_config -> patch_config.
 SAVING: only patch_config saves. validate_config is a dry run that changes nothing, so an edit is NOT done until patch_config has succeeded with the ops. After saving, re-read the changed part with get_config to confirm it. Never tell the user a change was made before patch_config returned saved:true.
 Field \`description\`s in the schema contain usage guidance (what values mean, how fields combine, what is generated from what): read the description of every field you are about to change; if an outline shows it as [truncated], drill into that field with get_schema \`path\` first.
-Rules: rich-text fields are Markdown, not HTML. Lists of objects are keyed by "id" (the server fills missing ids on new items). Image upload is not supported; reuse existing image URLs. Edits go live immediately, so validate first and keep changes minimal.`;
+Rules: rich-text fields are Markdown, not HTML. Lists of objects are keyed by "id" (the server fills missing ids on new items). Images/files: list_files, read_file, write_file (use a NEW unique file name), delete_file; then reference the file URL via patch_config. Site editors: list_editors, add_editor, change_editor_email, remove_editor. New sites: create_site. Edits go live immediately, so validate first and keep changes minimal.`;
 
 const OPS_HELP = `ops is an array of: {"op":"set","path":[...],"value":...} | {"op":"remove","path":[...]} | {"op":"listAdd","path":[...list path],"value":{...},"index"?:n} | {"op":"listReorder","path":[...list path],"ids":[...]}. A path is an array of field names; address a list item with {"id":"<item id>"}, e.g. ["pages","list",{"id":"abc"},"title"]. The first path segment must be a config section (see get_schema).`;
 
-const TOOLS = [
+const CORE_TOOLS = [
   {
     name: 'list_sites',
     description: 'List the site slugs the logged-in user can edit.',
@@ -51,6 +52,8 @@ const TOOLS = [
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
   },
 ];
+
+const TOOLS = [...CORE_TOOLS, ...EXTRA_TOOLS];
 
 // ---- helpers ---------------------------------------------------------------
 const text = (t, isError = false) => ({ content: [{ type: 'text', text: typeof t === 'string' ? t : JSON.stringify(t, null, 2) }], ...(isError ? { isError: true } : {}) });
@@ -206,7 +209,7 @@ async function callTool(name, args, ctx) {
         return text({ saved: true, skipped: body.skipped, assigned_ids: p.assigned, note: 'Live; a site rebuild was triggered.' });
       }
       default:
-        return fail(`Unknown tool "${name}"`);
+        return await callExtraTool(name, args, ctx);
     }
   } catch (e) {
     return fail(`Error: ${e.message}`);
