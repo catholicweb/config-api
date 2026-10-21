@@ -48,18 +48,32 @@ const REFS = [
   ...new Set([process.env.PARITY_REF, process.env.GITHUB_HEAD_REF, currentBranch(), 'main'].filter((r) => r && r !== 'HEAD')),
 ];
 
+async function get(url, headers) {
+  try {
+    const res = await fetch(url, { headers });
+    return { status: res.status, text: res.ok ? await res.text() : null };
+  } catch {
+    return { status: 0, text: null }; // offline
+  }
+}
+
 async function fetchFromGitHub() {
-  const headers = { Accept: 'application/vnd.github.raw+json', 'User-Agent': 'parity-test' };
   const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
-  if (token) headers.Authorization = `Bearer ${token}`;
+  const auth = token ? { Authorization: `Bearer ${token}` } : {};
   for (const ref of REFS) {
-    const url = `https://api.github.com/repos/${OWNER}/${PAIR.repo}/contents/${PAIR.path}?ref=${encodeURIComponent(ref)}`;
-    try {
-      const res = await fetch(url, { headers });
-      if (res.ok) return { code: await res.text(), from: `github ${OWNER}/${PAIR.repo}@${ref}` };
-    } catch {
-      // offline: try the next ref, then fail loudly below
-    }
+    // raw.githubusercontent.com first: unlike the REST API (60 requests/hour per
+    // IP when unauthenticated, easily exhausted on shared IPs) it has no such
+    // limit. The unique query string bypasses its CDN cache, so a branch pushed
+    // a moment ago is read fresh.
+    const raw = await get(`https://raw.githubusercontent.com/${OWNER}/${PAIR.repo}/${ref}/${PAIR.path}?nocache=${Date.now()}`, auth);
+    if (raw.text !== null) return { code: raw.text, from: `github ${OWNER}/${PAIR.repo}@${ref}` };
+    if (raw.status === 404) continue; // no such branch / file: try the next ref
+    const api = await get(`https://api.github.com/repos/${OWNER}/${PAIR.repo}/contents/${PAIR.path}?ref=${encodeURIComponent(ref)}`, {
+      Accept: 'application/vnd.github.raw+json',
+      'User-Agent': 'parity-test',
+      ...auth,
+    });
+    if (api.text !== null) return { code: api.text, from: `github ${OWNER}/${PAIR.repo}@${ref}` };
   }
   return null;
 }
