@@ -1,13 +1,26 @@
 // ⚠️⚠️⚠️ CRITICAL INTER-DEPENDENCY WARNING ⚠️⚠️⚠️
 //
-// This file is MIRRORED BYTE-FOR-BYTE in two repos and MUST stay identical:
-//   - editor/docs/.vitepress/theme/lib/patch.js   (the "diff" half — computes ops)
-//   - config-api/src/patch.js                     (the "apply" half — applies ops)
+// MIRRORED FILE. Everything after this comment block MUST stay byte-for-byte
+// identical in BOTH repos (the editor computes ops, the server applies them):
+//   editor     https://github.com/catholicweb/editor/blob/main/docs/.vitepress/theme/lib/patch.js      ("diff" half)
+//   config-api https://github.com/catholicweb/config-api/blob/main/src/patch.js                         ("apply" half)
 //
-// Same pattern as codec.js. If you change logic here, apply the SAME change to
-// the sibling file; a divergence silently corrupts concurrent saves (id
-// addressing, op ordering, or value shape would no longer agree between the
-// editor that produces the patch and the server that applies it).
+// A divergence silently corrupts concurrent saves (id addressing, op ordering
+// or value shape stop agreeing) and nothing fails loudly at runtime.
+//
+// RULES for ANY change, by a human or an AI tool:
+//   1. Change BOTH files in the same piece of work: the same branch name in
+//      both repos, one PR each, merged together. Never touch just one side.
+//   2. If a tool rewrites whole files (e.g. the GitHub API), re-read the other
+//      repo's file afterwards and compare it; do not trust a retyped copy.
+//   3. Run `npm test`: tests/parity.test.js compares this file with the other
+//      one (sibling clone, else the same-named branch, else main). It FAILS,
+//      never skips, when the counterpart can't be read; PARITY_SKIP=1 is the
+//      only deliberate opt-out.
+//   4. config-api deploys on every push to main WITHOUT running tests, so the
+//      check above is the only gate: run it before merging.
+//
+// Same pattern as codec.js (see ../CLAUDE.md for the cross-repo picture).
 //
 // The shared convention is 100% data-guided (no schema needed on the server):
 //   A "keyed" array is an array whose every item is a plain object carrying a
