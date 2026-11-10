@@ -65,6 +65,17 @@ workers_dev = false
 #                                                   # Without it @handle channels are skipped.
 #   (optional) PUBSUBHUBBUB_HUB                     # defaults to https://pubsubhubbub.appspot.com/
 #
+# Secrets required for event registrations (src/registration.js):
+#
+#   npx wrangler secret put REG_KEY                 # base64 of 32 random bytes; per-site AES-GCM/HMAC
+#                                                   # keys are derived from it (HKDF). BACK IT UP: without
+#                                                   # it stored registrations cannot be decrypted.
+#   npx wrangler secret put TURNSTILE_SECRET        # Cloudflare Turnstile widget secret (siteverify)
+#   (optional) TURNSTILE_HOSTNAMES                  # extra frontend hostnames accepted by siteverify,
+#                                                   # comma-separated. Use localhost ONLY in .dev.vars.
+#   (optional var) REG_RETENTION_DAYS               # registrations are deleted this many days after their
+#                                                   # last update by the daily cron (default 365)
+#
 # For local dev, put them in .dev.vars instead (gitignored).
 
 # Non-secret: where the emailed magic link points (the editor magic-link landing
@@ -80,6 +91,13 @@ DATA_BASE = "https://data.parroquia.app"
 [[r2_buckets]]
 binding = "CONTENT"
 bucket_name = "parroquia"
+
+# Private registrations database (personal data; NOT the public R2 bucket).
+# Schema: migrations/0001_registrations.sql (already applied).
+[[d1_databases]]
+binding = "REGDB"
+database_name = "parroquia-registrations"
+database_id = "2632b290-992a-4990-bc1b-116052f25bf0"
 
 
 [observability.logs]
