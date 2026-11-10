@@ -5,6 +5,7 @@ import base, { validateSlug, authorizeAdminOrEditor } from './index.js';
 import { handleMcp, corsPreflight } from './mcp.js';
 import * as oauth from './mcp-oauth.js';
 import { handleRegister, listRegistrations, purgeRegistrations } from './registration.js';
+import { handleSubscription } from './registration-notify.js';
 
 // Decode each path segment like index.js does (a decoded segment may not contain '/').
 function decodeSegments(pathname) {
@@ -28,18 +29,19 @@ export default {
     if (m !== 'OPTIONS') {
       const isRegister = p === '/api/register' || p.startsWith('/api/register/');
       const isRegList = m === 'GET' && /^\/sites\/[^/]+\/registrations\/?$/.test(p);
-      if (isRegister || isRegList) {
+      const isRegSub = ['GET', 'PUT', 'DELETE'].includes(m) && /^\/sites\/[^/]+\/registrations\/subscription\/?$/.test(p);
+      if (isRegister || isRegList || isRegSub) {
         try {
           const segments = decodeSegments(p);
           if (isRegister) {
-            const res = await handleRegister(env, request, segments, url);
+            const res = await handleRegister(env, request, segments, url, ctx);
             if (res) return res;
           } else {
             const slug = segments[1];
             if (!validateSlug(slug)) return new Response('Invalid slug', { status: 400 });
             const auth = await authorizeAdminOrEditor(env, slug, request);
             if (!auth.ok) return Response.json({ error: auth.error }, { status: auth.status });
-            return await listRegistrations(env, slug, url);
+            return await (isRegSub ? handleSubscription(env, slug, request) : listRegistrations(env, slug, url));
           }
         } catch (e) {
           console.error('[registration]', e);
