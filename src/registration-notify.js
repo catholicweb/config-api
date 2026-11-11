@@ -2,7 +2,12 @@
  * Organizer notifications for event registrations (companion of registration.js).
  *
  * Any editor of a site can subscribe, from the editor's "Inscripciones" tab, to an
- * email for every new / modified / cancelled registration of that site:
+ * email for every new / modified / cancelled registration of that site. The email
+ * carries NO personal data (no name, phone, email or notes): only the event, how many
+ * people the registration covers, the running total, and a link to the editor, where
+ * the data can be read. Nothing personal ever lands in an inbox outside the retention
+ * purge.
+ *
  *   GET    /sites/:slug/registrations/subscription   -> { ok, subscribed }
  *   PUT    /sites/:slug/registrations/subscription   -> subscribe the calling editor
  *   DELETE /sites/:slug/registrations/subscription   -> unsubscribe
@@ -15,7 +20,7 @@
  * its row via AAD); only an HMAC of it is kept in the clear, as the row key.
  *
  * Access is re-checked at send time: a subscriber who is no longer an editor of the
- * site is dropped instead of being sent personal data.
+ * site is dropped instead of being notified.
  */
 import { readAuthState, bearerToken, sha256Hex, normalizeEmail } from './index.js';
 import { siteKeys, seal, open, emailDigest, esc, sendRegistrationEmail, db } from './registration.js';
@@ -88,32 +93,26 @@ export async function handleSubscription(env, slug, request) {
 }
 
 const COPY = {
-  new: { subject: 'Nueva inscripción', lead: 'Se ha recibido una nueva inscripción.' },
-  updated: { subject: 'Inscripción modificada', lead: 'Una persona ha modificado su inscripción.' },
-  cancelled: { subject: 'Inscripción cancelada', lead: 'Una persona ha cancelado su inscripción.' },
+  new: { subject: 'Nueva inscripción', lead: (n) => `Se ha recibido una nueva inscripción (${n} ${n === 1 ? 'persona' : 'personas'}).` },
+  updated: { subject: 'Inscripción modificada', lead: (n) => `Una inscripción ha cambiado (ahora ${n} ${n === 1 ? 'persona' : 'personas'}).` },
+  cancelled: { subject: 'Inscripción cancelada', lead: (n) => `Se ha cancelado una inscripción (${n} ${n === 1 ? 'persona' : 'personas'}).` },
 };
 
-export function buildNotification(kind, { eventLabel, fields, totals }) {
+// No personal data on purpose: see the header comment.
+export function buildNotification(kind, { eventLabel, people, totals, editorUrl }) {
   const c = COPY[kind];
-  const rows = [
-    ['Evento', eventLabel],
-    ['Responsable', fields.name],
-    ['Teléfono', fields.phone],
-    ['Email', fields.email],
-    ['Personas', String(fields.people)],
-    ['Observaciones', fields.notes || '—'],
-  ];
+  const lead = c.lead(people);
   const total = `Total para este evento: ${totals.people} personas en ${totals.count} inscripciones.`;
-  const foot = 'Recibes este aviso porque lo activaste en la pestaña Inscripciones del editor; puedes desactivarlo allí.';
-  const text = `${c.lead}\n\n${rows.map(([k, v]) => `${k}: ${v}`).join('\n')}\n\n${total}\n\n${foot}`;
+  const see = 'Para ver los datos, entra en la pestaña Inscripciones del editor:';
+  const foot = 'Recibes este aviso porque lo activaste en esa pestaña; puedes desactivarlo allí.';
+  const text = `${lead}\n\nEvento: ${eventLabel}\n${total}\n\n${see}\n${editorUrl}\n\n${foot}`;
   const html = `<!DOCTYPE html><html><body style="margin:0;padding:0;background:#f5f5f5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
 <table width="100%" cellpadding="0" cellspacing="0"><tr><td align="center">
 <table width="600" cellpadding="0" cellspacing="0" style="background:#fff;border-radius:8px;margin:24px 16px;padding:32px 24px;"><tr><td>
-<p style="margin:0 0 16px;color:#1a1a1a;font-size:16px;">${esc(c.lead)}</p>
-<table cellpadding="6" cellspacing="0" style="margin:0 0 20px;font-size:15px;color:#333;">${rows
-    .map(([k, v]) => `<tr><td style="color:#888;vertical-align:top;">${esc(k)}</td><td style="white-space:pre-wrap;">${esc(v)}</td></tr>`)
-    .join('')}</table>
-<p style="margin:0 0 16px;color:#444;font-size:15px;">${esc(total)}</p>
+<p style="margin:0 0 8px;color:#1a1a1a;font-size:16px;">${esc(lead)}</p>
+<p style="margin:0 0 16px;color:#444;font-size:15px;"><strong>${esc(eventLabel)}</strong><br>${esc(total)}</p>
+<p style="margin:0 0 12px;color:#444;font-size:15px;">${esc(see)}</p>
+<p style="margin:0 0 20px;"><a href="${esc(editorUrl)}" style="display:inline-block;padding:12px 24px;background:#0066cc;color:#fff;text-decoration:none;border-radius:6px;font-weight:bold;">Abrir el editor</a></p>
 <p style="margin:0;color:#888;font-size:13px;">${esc(foot)}</p>
 </td></tr></table></td></tr></table></body></html>`;
   return { subject: `${c.subject}: ${eventLabel}`, text, html };
@@ -124,6 +123,7 @@ export function buildNotification(kind, { eventLabel, fields, totals }) {
  * Best effort: throws only on infrastructure errors (callers log and move on).
  */
 export async function notifySubscribers(env, slug, kind, { eventKey, eventLabel, fields }) {
+  // `fields` is the registration's data; only its head count is used (see header comment).
   if (!db(env)) return { sent: 0 };
   const keys = await siteKeys(env, slug);
   if (!keys) return { sent: 0 };
@@ -139,7 +139,13 @@ export async function notifySubscribers(env, slug, kind, { eventKey, eventLabel,
     .prepare('SELECT COUNT(*) AS n, COALESCE(SUM(people), 0) AS p FROM registrations WHERE site = ? AND event_key = ?')
     .bind(slug, eventKey)
     .first();
-  const mail = buildNotification(kind, { eventLabel, fields, totals: { count: t?.n ?? 0, people: t?.p ?? 0 } });
+  const editorUrl = new URL(env.MAGIC_LINK_BASE || 'https://editor.parroquia.app/magic').origin + '/';
+  const mail = buildNotification(kind, {
+    eventLabel,
+    people: Number(fields?.people) || 0,
+    totals: { count: t?.n ?? 0, people: t?.p ?? 0 },
+    editorUrl,
+  });
 
   const auth = await readAuthState(env);
   let sent = 0;
