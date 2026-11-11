@@ -36,6 +36,7 @@ import {
   base64ToBytes,
   toHex,
 } from './index.js';
+import { notifySubscribers } from './registration-notify.js';
 
 export const REG_ACTION = 'register';
 export const TURNSTILE_VERIFY_URL = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
@@ -119,7 +120,7 @@ export async function open(keys, slug, id, row) {
   }
 }
 
-async function emailDigest(keys, email) {
+export async function emailDigest(keys, email) {
   const sig = await crypto.subtle.sign('HMAC', keys.mac, enc.encode(normalizeEmail(email)));
   return toHex(new Uint8Array(sig));
 }
@@ -215,7 +216,7 @@ async function siteExists(env, slug) {
 // Email (Resend, same provider and sender as the magic links)
 // ---------------------------------------------------------------------------
 
-const esc = (s) =>
+export const esc = (s) =>
   String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 
 const STRINGS = {
@@ -265,7 +266,7 @@ export function buildEmail(lang, { eventLabel, fields, link }) {
   return { subject: t.subject(eventLabel), text, html };
 }
 
-async function sendRegistrationEmail(env, to, mail) {
+export async function sendRegistrationEmail(env, to, mail) {
   if (!env.RESEND_API_KEY) return { ok: false, error: 'RESEND_API_KEY not configured' };
   try {
     const res = await fetch('https://api.resend.com/emails', {
@@ -303,11 +304,19 @@ function editLink(pageUrl, slug, hostnames, id, secret) {
 // Handlers
 // ---------------------------------------------------------------------------
 
-function db(env) {
+export function db(env) {
   return env.REGDB || null;
 }
 
-async function createRegistration(env, request) {
+// Tell the organizers who subscribed (see registration-notify.js). Never delays or
+// fails the visitor's request: runs after the response when the runtime allows it.
+function later(ctx, promise) {
+  const safe = promise.catch((e) => console.error('registration: notification failed:', e?.message));
+  if (ctx?.waitUntil) ctx.waitUntil(safe);
+  return safe;
+}
+
+async function createRegistration(env, request, ctx) {
   const body = await readJsonBody(request);
   if (!body.ok) return json({ error: body.error }, 400);
   const d = body.data && typeof body.data === 'object' ? body.data : {};
@@ -356,6 +365,7 @@ async function createRegistration(env, request) {
   const link = editLink(d.pageUrl, slug, hostnames, id, secret);
   const sent = await sendRegistrationEmail(env, fields.email, buildEmail(lang, { eventLabel, fields, link }));
   if (!sent.ok) console.error('registration: confirmation email failed:', sent.error);
+  later(ctx, notifySubscribers(env, slug, 'new', { eventKey: d.event, eventLabel, fields }));
   return json({ ok: true, id, emailSent: sent.ok }, 201);
 }
 
@@ -387,7 +397,7 @@ async function getRegistration(env, id, url) {
   });
 }
 
-async function updateRegistration(env, id, request) {
+async function updateRegistration(env, id, request, ctx) {
   const body = await readJsonBody(request);
   if (!body.ok) return json({ error: body.error }, 400);
   const { row, res } = await loadWithSecret(env, id, body.data?.k);
@@ -403,13 +413,18 @@ async function updateRegistration(env, id, request) {
     .prepare('UPDATE registrations SET people = ?, email_hmac = ?, iv = ?, data = ?, updated_at = ? WHERE id = ?')
     .bind(f.people, await emailDigest(keys, f.email), sealed.iv, sealed.data, Date.now(), id)
     .run();
+  later(ctx, notifySubscribers(env, row.site, 'updated', { eventKey: row.event_key, eventLabel: row.event_label, fields: f }));
   return json({ ok: true });
 }
 
-async function deleteRegistration(env, id, url) {
+async function deleteRegistration(env, id, url, ctx) {
   const { row, res } = await loadWithSecret(env, id, url.searchParams.get('k'));
   if (res) return res;
+  // Read the data before it is gone, so the organizers can be told who cancelled.
+  const keys = await siteKeys(env, row.site);
+  const data = keys ? await open(keys, row.site, id, row) : null;
   await db(env).prepare('DELETE FROM registrations WHERE id = ?').bind(row.id).run();
+  if (data) later(ctx, notifySubscribers(env, row.site, 'cancelled', { eventKey: row.event_key, eventLabel: row.event_label, fields: data }));
   return json({ ok: true });
 }
 
@@ -417,14 +432,14 @@ async function deleteRegistration(env, id, url) {
  * Dispatch for /api/register[/:id]. `segments` are the already-decoded path
  * segments. Returns a Response, or null when the route does not match.
  */
-export async function handleRegister(env, request, segments, url) {
+export async function handleRegister(env, request, segments, url, ctx) {
   if (segments[0] !== 'api' || segments[1] !== 'register' || segments.length > 3) return null;
   const method = request.method.toUpperCase();
-  if (segments.length === 2) return method === 'POST' ? createRegistration(env, request) : null;
+  if (segments.length === 2) return method === 'POST' ? createRegistration(env, request, ctx) : null;
   const id = segments[2];
   if (method === 'GET') return getRegistration(env, id, url);
-  if (method === 'PUT') return updateRegistration(env, id, request);
-  if (method === 'DELETE') return deleteRegistration(env, id, url);
+  if (method === 'PUT') return updateRegistration(env, id, request, ctx);
+  if (method === 'DELETE') return deleteRegistration(env, id, url, ctx);
   return null;
 }
 
