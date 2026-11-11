@@ -78,7 +78,7 @@ describe('notifications', () => {
     return s;
   }
 
-  it('emails subscribers about new registrations, with the data and running totals', async () => {
+  it('emails subscribers about new registrations, with the head count and running totals', async () => {
     const { env, ctx } = await subscribed();
     expect((await call(env, ctx, 'POST', '/api/register', { body: reg() })).status).toBe(201);
     await call(env, ctx, 'POST', '/api/register', { body: reg({ name: 'Luis', email: 'luis@example.com', people: 6 }) });
@@ -86,8 +86,9 @@ describe('notifications', () => {
     const mails = to('priest@example.com');
     expect(mails).toHaveLength(2);
     expect(mails[0].subject).toBe('Nueva inscripción: Campamento');
-    expect(mails[0].text).toContain('Alergia a frutos secos');
+    expect(mails[0].text).toContain('(4 personas)');
     expect(mails[1].text).toContain('Total para este evento: 10 personas en 2 inscripciones.');
+    expect(mails[1].text).toContain('https://editor.parroquia.app/');
     expect(to('ana@example.com')).toHaveLength(1); // the registrant's own confirmation is unaffected
   });
 
@@ -108,12 +109,30 @@ describe('notifications', () => {
     await ctx.flush();
     const subjects = to('priest@example.com').map((x) => x.subject);
     expect(subjects).toEqual(['Nueva inscripción: Campamento', 'Inscripción modificada: Campamento', 'Inscripción cancelada: Campamento']);
-    expect(to('priest@example.com')[2].text).toContain('Ana'); // data read before it was deleted
+    expect(to('priest@example.com')[1].text).toContain('ahora 7 personas');
+    expect(to('priest@example.com')[2].text).toContain('Se ha cancelado una inscripción (7 personas)'); // as last edited
   });
 
-  it('escapes personal data in the HTML', async () => {
+  it('never includes personal data, in any kind of notification', async () => {
     const { env, ctx } = await subscribed();
-    await call(env, ctx, 'POST', '/api/register', { body: reg({ name: '<img src=x onerror=1>' }) });
+    await call(env, ctx, 'POST', '/api/register', { body: reg({ name: 'Zacarías Quijano', phone: '699888777', email: 'zac@example.com', notes: 'Alergia a frutos secos' }) });
+    const m = /edit=([0-9a-f]{32})\.([0-9a-f]{64})/.exec(to('zac@example.com')[0].text);
+    await call(env, ctx, 'PUT', `/api/register/${m[1]}`, { body: { k: m[2], name: 'Zacarías Quijano', phone: '699888777', email: 'zac@example.com', people: 2, notes: 'Alergia a frutos secos' } });
+    await call(env, ctx, 'DELETE', `/api/register/${m[1]}?k=${m[2]}`);
+    await ctx.flush();
+    const notes = to('priest@example.com');
+    expect(notes).toHaveLength(3);
+    for (const n of notes) {
+      for (const secret of ['Zacar', 'Quijano', '699888777', 'zac@example.com', 'frutos', 'Alergia']) {
+        expect(n.text).not.toContain(secret);
+        expect(n.html).not.toContain(secret);
+      }
+    }
+  });
+
+  it('escapes the event label in the HTML', async () => {
+    const { env, ctx } = await subscribed();
+    await call(env, ctx, 'POST', '/api/register', { body: reg({ eventLabel: '<img src=x onerror=1>' }) });
     await ctx.flush();
     expect(to('priest@example.com')[0].html).toContain('&lt;img src=x onerror=1&gt;');
   });
