@@ -6,6 +6,7 @@ import { handleMcp, corsPreflight } from './mcp.js';
 import * as oauth from './mcp-oauth.js';
 import { handleRegister, listRegistrations, purgeRegistrations } from './registration.js';
 import { handleSubscription } from './registration-notify.js';
+import { guardRequest } from './guards.js';
 
 // Decode each path segment like index.js does (a decoded segment may not contain '/').
 function decodeSegments(pathname) {
@@ -16,6 +17,12 @@ function decodeSegments(pathname) {
     out.push(d);
   }
   return out;
+}
+
+// Every request to the base API (direct or MCP-forwarded) passes the guards first.
+async function guardedBase(request, env, ctx) {
+  const g = await guardRequest(env, request);
+  return g.response || base.fetch(g.request, env, ctx);
 }
 
 export default {
@@ -52,11 +59,11 @@ export default {
 
     const mcpPath = p === '/mcp' || p === '/oauth/authorize' || p === '/oauth/confirm' || p === '/oauth/token' ||
       p === '/oauth/register' || p.startsWith('/.well-known/oauth-');
-    if (!mcpPath) return base.fetch(request, env, ctx);
+    if (!mcpPath) return guardedBase(request, env, ctx);
 
     if (m === 'OPTIONS') return corsPreflight();
     try {
-      if (p === '/mcp') return await handleMcp(request, env, ctx, (req) => base.fetch(req, env, ctx));
+      if (p === '/mcp') return await handleMcp(request, env, ctx, (req) => guardedBase(req, env, ctx));
       if (p.startsWith('/.well-known/oauth-protected-resource') && m === 'GET') return oauth.protectedResourceMetadata(url.origin);
       if (p.startsWith('/.well-known/oauth-authorization-server') && m === 'GET') return oauth.authorizationServerMetadata(url.origin);
       if (p === '/oauth/register' && m === 'POST') return await oauth.register(env, request);
