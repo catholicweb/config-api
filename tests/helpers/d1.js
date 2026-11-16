@@ -2,9 +2,9 @@
 import { DatabaseSync } from 'node:sqlite';
 import { readFileSync } from 'node:fs';
 
-export function makeD1() {
+export function makeD1(migration = 'migrations/0001_registrations.sql') {
   const sqlite = new DatabaseSync(':memory:');
-  sqlite.exec(readFileSync(new URL('../../migrations/0001_registrations.sql', import.meta.url), 'utf8'));
+  sqlite.exec(readFileSync(new URL(`../../${migration}`, import.meta.url), 'utf8'));
   const wrap = (sql, args = []) => ({
     bind: (...a) => wrap(sql, a),
     first: async () => sqlite.prepare(sql).get(...args) ?? null,

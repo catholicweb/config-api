@@ -39,11 +39,33 @@ ones.
   code): a Transform Rule on `data.parroquia.app` adding
   `X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox`.
 
+## Credential store (`src/auth-store.js`, D1 binding `AUTHDB`)
+
+Credentials no longer live in `auth.enc` in the public bucket. `worker.js` wraps
+`env` with `withAuthStore`: `env.CONTENT` serves/writes the key `auth.enc` from a
+single private D1 row and passes every other key to R2, so `index.js` is
+unchanged. The row holds the same AES-GCM blob (AUTH_KEY stays as defense in
+depth). Without the binding nothing changes.
+
+- **No lost updates**: writes are compare-and-swap on `version`. If someone wrote
+  first, the request's change (diff between what it read and what it wants to
+  write; element-wise for slug lists) is re-applied on the latest state and
+  retried. A stale request can no longer resurrect a revoked editor.
+- **Single-use codes**: consuming a `magic`/`oauth` entry that another request
+  already consumed fails with `AuthConflictError` (HTTP 500), so a code can't be
+  redeemed twice concurrently.
+- **Migration**: lazy. When the D1 table is empty, the first read imports the R2
+  `auth.enc` once; D1 is the source of truth from then on.
+
+Rollout: (1) `wrangler d1 create parroquia-auth`, paste the id in `wrangler.toml`;
+(2) `wrangler d1 migrations apply parroquia-auth --remote`; (3) merge/deploy and
+check an editor login; (4) **delete `auth.enc` from the R2 bucket** (it was
+publicly downloadable; the ciphertext is only as safe as AUTH_KEY). D1 Time
+Travel covers backups. Optional: rotate AUTH_KEY afterwards so any previously
+downloaded copy of the old blob is useless even if the old key ever leaks.
+
 ## Known follow-ups
 
-- Move `auth.enc` to D1 (one row per token/grant/code): fixes lost-update races
-  (revocations can be undone by a concurrent write) and keeps credentials out of
-  the public bucket.
 - Per-pool site-creation quota with admin notification.
 - Token expiry (MCP tokens first); enforce MCP token scope.
 - Cloudflare rate-limit rules / Turnstile on open endpoints.
