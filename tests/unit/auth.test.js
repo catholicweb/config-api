@@ -29,7 +29,10 @@ import {
   AUTH_STATE_V,
   MAGIC_TTL_MS,
 } from '../../src/index.js';
-import { MockR2 } from '../helpers/mock-r2.js';
+import { MockR2, seedAuthBlob } from '../helpers/mock-r2.js';
+import { makeD1 } from '../helpers/d1.js';
+
+const AUTH_SQL = 'migrations-auth/0001_auth_state.sql';
 
 // --- Test fixtures & helpers --------------------------------------------------
 
@@ -44,6 +47,7 @@ function makeAuthKey() {
 function makeEnv(r2, overrides = {}) {
   return {
     CONTENT: r2,
+    AUTHDB: makeD1(AUTH_SQL),
     AUTH_KEY: makeAuthKey(),
     ADMIN_TOKEN_HASH: null, // set per-test
     ...overrides,
@@ -53,6 +57,7 @@ function makeEnv(r2, overrides = {}) {
 function makeAuthEnv(r2, adminToken = ADMIN_TOKEN) {
   return {
     CONTENT: r2,
+    AUTHDB: makeD1(AUTH_SQL),
     AUTH_KEY: makeAuthKey(),
     ADMIN_TOKEN_HASH: null, // set asynchronously below
   };
@@ -67,17 +72,15 @@ function makeRequest(token) {
 async function makeAdminEnv(r2, adminToken = ADMIN_TOKEN) {
   return {
     CONTENT: r2,
+    AUTHDB: makeD1(AUTH_SQL),
     AUTH_KEY: makeAuthKey(),
     ADMIN_TOKEN_HASH: await sha256Hex(adminToken),
   };
 }
 
-// Seed auth.enc with a given state
+// Seed the credential row (AUTHDB) with a given state
 async function seedAuth(r2, env, state) {
-  const blob = await encryptState(env, state);
-  await r2.put(AUTH_FILE, JSON.stringify(blob), {
-    httpMetadata: { contentType: 'application/json', cacheControl: 'public, max-age=0, must-revalidate' },
-  });
+  seedAuthBlob(env, JSON.stringify(await encryptState(env, state)));
 }
 
 // Create a full auth state with one email+editor grant
@@ -139,7 +142,7 @@ describe('authKey', () => {
 describe('encryptState / decryptState', () => {
   it('roundtrips a state object', async () => {
     const r2 = new MockR2();
-    const env = { CONTENT: r2, AUTH_KEY: makeAuthKey() };
+    const env = { CONTENT: r2, AUTHDB: makeD1(AUTH_SQL), AUTH_KEY: makeAuthKey() };
     const state = { emails: { 'a@b.com': ['slug1'] }, tokens: {}, magic: {} };
     const blob = await encryptState(env, state);
     expect(blob).not.toBeNull();
@@ -200,23 +203,23 @@ describe('encryptState / decryptState', () => {
 // --- readAuthState ------------------------------------------------============
 
 describe('readAuthState', () => {
-  it('returns virgin empty state when auth.enc is missing', async () => {
+  it('returns virgin empty state when nothing is stored', async () => {
     const r2 = new MockR2();
-    const env = { CONTENT: r2, AUTH_KEY: makeAuthKey() };
+    const env = { CONTENT: r2, AUTHDB: makeD1(AUTH_SQL), AUTH_KEY: makeAuthKey() };
     const state = await readAuthState(env);
     expect(state).toEqual({ emails: {}, tokens: {}, magic: {} });
   });
 
-  it('returns null when auth.enc is corrupt JSON', async () => {
+  it('returns null when the stored blob is corrupt JSON', async () => {
     const r2 = new MockR2();
-    await r2.put(AUTH_FILE, 'not json', { httpMetadata: { contentType: 'application/json' } });
-    const env = { CONTENT: r2, AUTH_KEY: makeAuthKey() };
+    const env = { CONTENT: r2, AUTHDB: makeD1(AUTH_SQL), AUTH_KEY: makeAuthKey() };
+    seedAuthBlob(env, 'not json');
     expect(await readAuthState(env)).toBeNull();
   });
 
-  it('returns the decrypted state when auth.enc is valid', async () => {
+  it('returns the decrypted state when the stored blob is valid', async () => {
     const r2 = new MockR2();
-    const env = { CONTENT: r2, AUTH_KEY: makeAuthKey() };
+    const env = { CONTENT: r2, AUTHDB: makeD1(AUTH_SQL), AUTH_KEY: makeAuthKey() };
     const state = { emails: { 'a@b.com': ['site1'] }, tokens: {}, magic: {} };
     await seedAuth(r2, env, state);
     const result = await readAuthState(env);
@@ -226,10 +229,10 @@ describe('readAuthState', () => {
   it('returns null when AUTH_KEY is invalid (decrypt fails)', async () => {
     const r2 = new MockR2();
     // Seed with one key...
-    const seedEnv = { CONTENT: r2, AUTH_KEY: makeAuthKey() };
+    const seedEnv = { CONTENT: r2, AUTHDB: makeD1(AUTH_SQL), AUTH_KEY: makeAuthKey() };
     await seedAuth(r2, seedEnv, { emails: {}, tokens: {}, magic: {} });
     // ...but read with no AUTH_KEY
-    const readEnv = { CONTENT: r2, AUTH_KEY: null };
+    const readEnv = { ...seedEnv, AUTH_KEY: null };
     expect(await readAuthState(readEnv)).toBeNull();
   });
 });
@@ -237,38 +240,43 @@ describe('readAuthState', () => {
 // --- writeAuthState -----------------------------------------------------------
 
 describe('writeAuthState', () => {
-  it('writes auth.enc and returns {ok: true}', async () => {
+  it('stores the encrypted state in AUTHDB and returns {ok: true}', async () => {
     const r2 = new MockR2();
-    const env = { CONTENT: r2, AUTH_KEY: makeAuthKey() };
-    const state = { emails: { 'a@b.com': ['site1'] }, tokens: {}, magic: {} };
+    const env = { CONTENT: r2, AUTHDB: makeD1(AUTH_SQL), AUTH_KEY: makeAuthKey() };
+    const state = await readAuthState(env); // writeAuthState needs a state from readAuthState
+    state.emails['a@b.com'] = ['site1'];
     const result = await writeAuthState(env, state);
     expect(result.ok).toBe(true);
     expect(result.error).toBeNull();
-    expect(r2.has(AUTH_FILE)).toBe(true);
+    expect(env.AUTHDB._sqlite.prepare('SELECT COUNT(*) n FROM auth_state').get().n).toBe(1);
+    expect(r2.has(AUTH_FILE)).toBe(false); // nothing in the public bucket
   });
 
   it('returns ok:false when AUTH_KEY is missing', async () => {
     const r2 = new MockR2();
-    const env = { CONTENT: r2, AUTH_KEY: null };
-    const result = await writeAuthState(env, { emails: {}, tokens: {}, magic: {} });
+    const env = { CONTENT: r2, AUTHDB: makeD1(AUTH_SQL), AUTH_KEY: null };
+    const result = await writeAuthState(env, await readAuthState(env));
     expect(result.ok).toBe(false);
     expect(result.error).toContain('AUTH_KEY');
   });
 
-  it('returns ok:false when AUTH_KEY is invalid base64', async () => {
-    const r2 = new MockR2();
-    const env = { CONTENT: r2, AUTH_KEY: '!!!notbase64!!!' };
+  it('returns ok:false for a state that did not come from readAuthState', async () => {
+    const env = { CONTENT: new MockR2(), AUTHDB: makeD1(AUTH_SQL), AUTH_KEY: makeAuthKey() };
     const result = await writeAuthState(env, { emails: {}, tokens: {}, magic: {} });
     expect(result.ok).toBe(false);
-    expect(result.error).toBeTruthy();
+    expect(result.error).toContain('readAuthState');
   });
 
-  it('writes correct cache headers on auth.enc', async () => {
+  it('readAuthState returns null (503 upstream) when AUTHDB is not bound', async () => {
+    expect(await readAuthState({ CONTENT: new MockR2(), AUTH_KEY: makeAuthKey() })).toBeNull();
+  });
+
+  it('returns ok:false when AUTH_KEY is invalid base64', async () => {
     const r2 = new MockR2();
-    const env = { CONTENT: r2, AUTH_KEY: makeAuthKey() };
-    await writeAuthState(env, { emails: {}, tokens: {}, magic: {} });
-    const obj = await r2.get(AUTH_FILE);
-    expect(obj.httpMetadata.cacheControl).toBe('public, max-age=0, must-revalidate');
+    const env = { CONTENT: r2, AUTHDB: makeD1(AUTH_SQL), AUTH_KEY: '!!!notbase64!!!' };
+    const result = await writeAuthState(env, await readAuthState(env));
+    expect(result.ok).toBe(false);
+    expect(result.error).toBeTruthy();
   });
 });
 
@@ -343,7 +351,7 @@ describe('pruneAuthState', () => {
 describe('mutateState', () => {
   it('reads, applies mutation, writes back', async () => {
     const r2 = new MockR2();
-    const env = { CONTENT: r2, AUTH_KEY: makeAuthKey() };
+    const env = { CONTENT: r2, AUTHDB: makeD1(AUTH_SQL), AUTH_KEY: makeAuthKey() };
     await seedAuth(r2, env, { emails: { 'a@b.com': ['s1'] }, tokens: {}, magic: {} });
 
     const result = await mutateState(env, (state) => {
@@ -360,9 +368,9 @@ describe('mutateState', () => {
 
   it('returns ok:false when state cannot be read', async () => {
     const r2 = new MockR2();
-    // auth.enc is corrupt
-    await r2.put(AUTH_FILE, 'corrupt json', { httpMetadata: { contentType: 'application/json' } });
-    const env = { CONTENT: r2, AUTH_KEY: makeAuthKey() };
+    // the stored blob is corrupt
+    const env = { CONTENT: r2, AUTHDB: makeD1(AUTH_SQL), AUTH_KEY: makeAuthKey() };
+    seedAuthBlob(env, 'corrupt json');
     const result = await mutateState(env, (state) => { state.emails['a@b.com'] = ['s1']; });
     expect(result.ok).toBe(false);
     expect(result.error).toBe('auth state unavailable');
@@ -370,7 +378,7 @@ describe('mutateState', () => {
 
   it('returns ok:false when AUTH_KEY is missing (write fails)', async () => {
     const r2 = new MockR2();
-    const env = { CONTENT: r2, AUTH_KEY: null };
+    const env = { CONTENT: r2, AUTHDB: makeD1(AUTH_SQL), AUTH_KEY: null };
     const result = await mutateState(env, (state) => { state.emails['a@b.com'] = ['s1']; });
     expect(result.ok).toBe(false);
   });
@@ -381,7 +389,7 @@ describe('mutateState', () => {
 describe('authorize (editor gate for slug)', () => {
   it('returns 401 when bearer token is missing', async () => {
     const r2 = new MockR2();
-    const env = { CONTENT: r2, AUTH_KEY: makeAuthKey() };
+    const env = { CONTENT: r2, AUTHDB: makeD1(AUTH_SQL), AUTH_KEY: makeAuthKey() };
     const req = makeRequest(null);
     const result = await authorize(env, 'myslug', req);
     expect(result.ok).toBe(false);
@@ -391,7 +399,7 @@ describe('authorize (editor gate for slug)', () => {
 
   it('returns 403 when token hash is not in state', async () => {
     const r2 = new MockR2();
-    const env = { CONTENT: r2, AUTH_KEY: makeAuthKey() };
+    const env = { CONTENT: r2, AUTHDB: makeD1(AUTH_SQL), AUTH_KEY: makeAuthKey() };
     await seedAuth(r2, env, { emails: {}, tokens: {}, magic: {} });
     const req = makeRequest('nonexistent-token');
     const result = await authorize(env, 'myslug', req);
@@ -402,7 +410,7 @@ describe('authorize (editor gate for slug)', () => {
 
   it('returns ok:true when email-bound token is granted on the slug', async () => {
     const r2 = new MockR2();
-    const env = { CONTENT: r2, AUTH_KEY: makeAuthKey() };
+    const env = { CONTENT: r2, AUTHDB: makeD1(AUTH_SQL), AUTH_KEY: makeAuthKey() };
     const { editorToken } = await seedEditorState(r2, env, 'editor@example.com', 'myslug');
     const req = makeRequest(editorToken);
     const result = await authorize(env, 'myslug', req);
@@ -411,7 +419,7 @@ describe('authorize (editor gate for slug)', () => {
 
   it('returns 403 when token is granted but email is not in the slug grant list', async () => {
     const r2 = new MockR2();
-    const env = { CONTENT: r2, AUTH_KEY: makeAuthKey() };
+    const env = { CONTENT: r2, AUTHDB: makeD1(AUTH_SQL), AUTH_KEY: makeAuthKey() };
     const { editorToken } = await seedEditorState(r2, env, 'editor@example.com', 'myslug');
     // Try to access a DIFFERENT slug
     const req = makeRequest(editorToken);
@@ -423,7 +431,7 @@ describe('authorize (editor gate for slug)', () => {
 
   it('returns ok:true for email-less defensive token on its own slug', async () => {
     const r2 = new MockR2();
-    const env = { CONTENT: r2, AUTH_KEY: makeAuthKey() };
+    const env = { CONTENT: r2, AUTHDB: makeD1(AUTH_SQL), AUTH_KEY: makeAuthKey() };
     const token = generateToken();
     const tokenHash = await sha256Hex(token);
     // Email-less token bound to 'myslug'
@@ -441,7 +449,7 @@ describe('authorize (editor gate for slug)', () => {
 
   it('returns 403 for email-less defensive token on a different slug', async () => {
     const r2 = new MockR2();
-    const env = { CONTENT: r2, AUTH_KEY: makeAuthKey() };
+    const env = { CONTENT: r2, AUTHDB: makeD1(AUTH_SQL), AUTH_KEY: makeAuthKey() };
     const token = generateToken();
     const tokenHash = await sha256Hex(token);
     await seedAuth(r2, env, {
@@ -456,10 +464,10 @@ describe('authorize (editor gate for slug)', () => {
     expect(result.error).toBe('editor token requires bound email');
   });
 
-  it('returns 503 when auth state is unavailable (corrupt auth.enc)', async () => {
+  it('returns 503 when auth state is unavailable (corrupt stored blob)', async () => {
     const r2 = new MockR2();
-    await r2.put(AUTH_FILE, 'corrupt', { httpMetadata: { contentType: 'application/json' } });
-    const env = { CONTENT: r2, AUTH_KEY: makeAuthKey() };
+    const env = { CONTENT: r2, AUTHDB: makeD1(AUTH_SQL), AUTH_KEY: makeAuthKey() };
+    seedAuthBlob(env, 'corrupt');
     const req = makeRequest('any-token');
     const result = await authorize(env, 'myslug', req);
     expect(result.ok).toBe(false);
@@ -473,7 +481,7 @@ describe('authorize (editor gate for slug)', () => {
 describe('authorizeAdmin', () => {
   it('returns 401 when bearer token is missing', async () => {
     const r2 = new MockR2();
-    const env = { CONTENT: r2, AUTH_KEY: makeAuthKey(), ADMIN_TOKEN_HASH: null };
+    const env = { CONTENT: r2, AUTHDB: makeD1(AUTH_SQL), AUTH_KEY: makeAuthKey(), ADMIN_TOKEN_HASH: null };
     const req = makeRequest(null);
     const result = await authorizeAdmin(env, req);
     expect(result.ok).toBe(false);
@@ -483,7 +491,7 @@ describe('authorizeAdmin', () => {
 
   it('returns 503 when ADMIN_TOKEN_HASH is not configured', async () => {
     const r2 = new MockR2();
-    const env = { CONTENT: r2, AUTH_KEY: makeAuthKey(), ADMIN_TOKEN_HASH: null };
+    const env = { CONTENT: r2, AUTHDB: makeD1(AUTH_SQL), AUTH_KEY: makeAuthKey(), ADMIN_TOKEN_HASH: null };
     const req = makeRequest('some-token');
     const result = await authorizeAdmin(env, req);
     expect(result.ok).toBe(false);
@@ -523,7 +531,7 @@ describe('authorizeAdminOrEditor', () => {
 
   it('passes through when editor token is valid for the slug', async () => {
     const r2 = new MockR2();
-    const env = { CONTENT: r2, AUTH_KEY: makeAuthKey() };
+    const env = { CONTENT: r2, AUTHDB: makeD1(AUTH_SQL), AUTH_KEY: makeAuthKey() };
     const { editorToken } = await seedEditorState(r2, env, 'editor@example.com', 'myslug');
     const req = makeRequest(editorToken);
     const result = await authorizeAdminOrEditor(env, 'myslug', req);
@@ -532,7 +540,7 @@ describe('authorizeAdminOrEditor', () => {
 
   it('fails when both admin and editor checks fail', async () => {
     const r2 = new MockR2();
-    const env = { CONTENT: r2, AUTH_KEY: makeAuthKey(), ADMIN_TOKEN_HASH: null };
+    const env = { CONTENT: r2, AUTHDB: makeD1(AUTH_SQL), AUTH_KEY: makeAuthKey(), ADMIN_TOKEN_HASH: null };
     await seedAuth(r2, env, { emails: {}, tokens: {}, magic: {} });
     const req = makeRequest('invalid-token');
     const result = await authorizeAdminOrEditor(env, 'myslug', req);
@@ -553,7 +561,7 @@ describe('authorizeAdminOrEditorAny', () => {
 
   it('passes through when a valid email-bound editor token is present', async () => {
     const r2 = new MockR2();
-    const env = { CONTENT: r2, AUTH_KEY: makeAuthKey() };
+    const env = { CONTENT: r2, AUTHDB: makeD1(AUTH_SQL), AUTH_KEY: makeAuthKey() };
     const { editorToken } = await seedEditorState(r2, env, 'editor@example.com', 'myslug');
     const req = makeRequest(editorToken);
     const result = await authorizeAdminOrEditorAny(env, req);
@@ -562,7 +570,7 @@ describe('authorizeAdminOrEditorAny', () => {
 
   it('rejects email-less defensive tokens (no grant to check against)', async () => {
     const r2 = new MockR2();
-    const env = { CONTENT: r2, AUTH_KEY: makeAuthKey() };
+    const env = { CONTENT: r2, AUTHDB: makeD1(AUTH_SQL), AUTH_KEY: makeAuthKey() };
     const token = generateToken();
     const tokenHash = await sha256Hex(token);
     await seedAuth(r2, env, {
@@ -578,7 +586,7 @@ describe('authorizeAdminOrEditorAny', () => {
 
   it('rejects a token whose email has no grants', async () => {
     const r2 = new MockR2();
-    const env = { CONTENT: r2, AUTH_KEY: makeAuthKey() };
+    const env = { CONTENT: r2, AUTHDB: makeD1(AUTH_SQL), AUTH_KEY: makeAuthKey() };
     const token = generateToken();
     const tokenHash = await sha256Hex(token);
     const email = 'orphan@example.com';

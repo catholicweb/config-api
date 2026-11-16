@@ -24,6 +24,7 @@
 // (could be regarded as a part of the same inter-dependency contract):
 // applyPatch applies the editor's diff ops onto the stored doc.
 import { applyPatch } from './patch.js';
+import { loadAuthBlob, saveAuthBlob, AuthConflictError } from './auth-store.js';
 import { scheduled as sendNotificationsCron, getGoogleAccessToken } from './notifications.js';
 
 /**
@@ -660,19 +661,35 @@ export async function decryptState(env, blob) {
 }
 
 // Read the whole auth store. Returns the state, or null if it cannot be
-// decrypted (AUTH_KEY wrong/corrupt). A missing auth.enc (fresh store) reads as
-// a virgin empty state — no AUTH_KEY or migration is needed to read an absent
-// blob; auth.enc is created lazily on the first write.
+// decrypted (AUTH_KEY wrong/corrupt) or the AUTHDB binding is missing. Nothing
+// stored yet reads as a virgin empty state — no AUTH_KEY is needed to read
+// that; the row is created lazily on the first write. Storage is a private D1
+// row (src/auth-store.js).
+//
+// The returned state remembers which stored version it was read from (symbol
+// below, not enumerable, not serialized) so writeAuthState can merge with
+// concurrent writers instead of overwriting them.
+const AUTH_BASE = Symbol('authBase');
+
 export async function readAuthState(env) {
-  const obj = await env.CONTENT.get(AUTH_FILE);
-  if (!obj) return { emails: {}, tokens: {}, magic: {} }; // virgin state
-  let blob;
-  try {
-    blob = JSON.parse(await obj.text());
-  } catch {
+  if (!env.AUTHDB) {
+    console.error('[auth] AUTHDB binding is not configured');
     return null;
   }
-  return decryptState(env, blob);
+  const base = await loadAuthBlob(env);
+  let state;
+  if (base.blob === null) {
+    state = { emails: {}, tokens: {}, magic: {} }; // virgin state
+  } else {
+    try {
+      state = await decryptState(env, JSON.parse(base.blob));
+    } catch {
+      return null;
+    }
+    if (!state) return null;
+  }
+  Object.defineProperty(state, AUTH_BASE, { value: base, writable: true });
+  return state;
 }
 
 // Drop state that can never be used again, so the single auth.enc blob does not
@@ -693,18 +710,33 @@ export function pruneAuthState(state) {
   }
 }
 
-// Write the whole auth store back as a single encrypted blob. Returns
-// { ok:true, error:null } on success, or { ok:false, error } when AUTH_KEY is
-// missing/invalid and the store can't be encrypted. Never throws.
+// Write the whole auth store back as a single encrypted blob. `state` must come
+// from readAuthState. Returns { ok:true, error:null } on success, or
+// { ok:false, error } when AUTH_KEY is missing/invalid or a concurrent change
+// couldn't be merged (callers answer 503; retrying is safe).
 export async function writeAuthState(env, state) {
+  const base = state[AUTH_BASE];
+  if (!base) return { ok: false, error: 'auth state was not loaded with readAuthState' };
   pruneAuthState(state);
   const blob = await encryptState(env, state);
   if (!blob) {
     return { ok: false, error: 'auth encryption key not configured (AUTH_KEY not set or invalid)' };
   }
-  await env.CONTENT.put(AUTH_FILE, JSON.stringify(blob), {
-    httpMetadata: { contentType: 'application/json', cacheControl: CACHE_REVALIDATE },
-  });
+  const codec = {
+    decrypt: async (text) => {
+      try { return await decryptState(env, JSON.parse(text)); } catch { return null; }
+    },
+    encrypt: async (s) => {
+      const b = await encryptState(env, s);
+      return b && JSON.stringify(b);
+    },
+  };
+  try {
+    state[AUTH_BASE] = await saveAuthBlob(env, base, JSON.stringify(blob), codec);
+  } catch (e) {
+    if (e instanceof AuthConflictError) return { ok: false, error: 'auth state changed concurrently; retry' };
+    throw e;
+  }
   return { ok: true, error: null };
 }
 
@@ -1163,8 +1195,10 @@ async function deleteCustomDomain(env, slug) {
 // longer be exchanged for an editor token.
 export const MAGIC_TTL_MS = 15 * 60 * 1000;
 
-// Single encrypted credential store at the bucket root (replaces auth.json,
-// magic.json, emails.json). Its plaintext payload is { emails, tokens, magic }.
+// LEGACY: the pre-D1 credential object at the bucket root. Credentials now live
+// in D1 (see readAuthState / src/auth-store.js). The name is kept only so
+// backfill-cache keeps skipping the object while it still exists in R2; remove it
+// together with the one-time import block in auth-store.js (loadAuthBlob).
 export const AUTH_FILE = 'auth.enc';
 export const AUTH_STATE_V = 1; // encrypted-blob format version
 

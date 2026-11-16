@@ -74,16 +74,17 @@ Key helper groups (each has a `// ---` banner comment):
   `validateSlugNotReserved`. The core of the path-traversal defense.
 - **Crypto** — `sha256Hex`, `generateToken`, `timingSafeEqual`, `bearerToken`,
   plus the AES-GCM state helpers (`authKey`, `encryptState`, `decryptState`,
-  `bytesToBase64`/`base64ToBytes`) for `auth.enc`. (HMAC email hashing was removed.)
+  `bytesToBase64`/`base64ToBytes`) for the credential blob. (HMAC email hashing was removed.)
 - **Auth** — `authorizeAdmin` (admin secret check), `authorize` (editor token →
   slug + email-grant check), `authorizeAdminOrEditor` (admin **or** editor-token
   gate for the /editors roster), `authorizeAdminOrEditorAny` (admin **or** any
   valid editor token — slug-agnostic gate for site creation `POST /sites/:slug`),
   and the encrypted-state helpers `readAuthState`/`writeAuthState`/`mutateState`.
   All
-  credential data lives in ONE AES-GCM-256 blob `auth.enc` at the bucket root
-  (decrypted under `AUTH_KEY` to `{ emails, tokens, magic }`), created lazily on
-  the first write. Editor tokens are bound to a plaintext
+  credential data lives in ONE AES-GCM-256 blob in a private D1 row (binding
+  `AUTHDB`, storage + merge logic in `src/auth-store.js`; decrypted under
+  `AUTH_KEY` to `{ emails, tokens, magic }`), created lazily on the first write.
+  Editor tokens are bound to a plaintext
   email (`tokens[sha256(token)] = { slug, email }`); the **recoverable** `emails`
   grant (`email → [slugs]`, enforced by `authorize`) is the editor allowlist —
   it never lives in the public `config.json`. `issueMagicLink`
@@ -137,13 +138,14 @@ Key helper groups (each has a `// ---` banner comment):
   re-stamped in place by the admin-gated `POST /sites/backfill-cache` handler
   (`backfillCache`), which re-applies the same `CACHE_*`/`LIVING_FILES` policy
   bucket-wide. See README "Caching".
-- **`auth.enc` read-modify-write races**: every credential mutation reads, mutates,
-  and writes back the single encrypted `auth.enc`, so concurrent mutations can lose
-  an update (last write wins — R2 has no CAS here). This aggregates the old
-  per-file races into one file but is no worse per-operation; acceptable given the
-  occasional-administration workload, not mass concurrent minting.
-- **`AUTH_KEY` is the single point of failure.** `auth.enc` is the only copy of every
-  token and grant (the bucket is public). It must be base64 of exactly 32 bytes; a
+- **Credential read-modify-write**: every mutation reads the whole state, mutates
+  it and writes it back. The D1 write is a compare-and-swap on a row `version`;
+  when another request wrote first, the change is merged onto the latest state
+  and retried (`auth-store.js`), so concurrent mutations no longer lose updates
+  and single-use codes can't be redeemed twice. A write that can't be merged
+  returns `{ ok:false }` (503, retry is safe).
+- **`AUTH_KEY` is the single point of failure.** The AUTHDB row is the only copy of every
+  token and grant. It must be base64 of exactly 32 bytes; a
   missing or invalid key means encrypts fail (every write returns `503`, `auth
   encryption key not configured`) and decrypts fail (`readAuthState` → null → handlers
   503). There is no migration — `auth.enc` is created lazily on the first write and
