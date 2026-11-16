@@ -108,7 +108,7 @@ database_id = "2632b290-992a-4990-bc1b-116052f25bf0"
 [[d1_databases]]
 binding = "AUTHDB"
 database_name = "parroquia-auth"
-database_id = "REPLACE_WITH_ID_FROM_wrangler_d1_create"
+database_id = "b6cb7a2e-8f36-46d5-9c84-7e29dbabaf88"
 migrations_dir = "migrations-auth"
 
 
