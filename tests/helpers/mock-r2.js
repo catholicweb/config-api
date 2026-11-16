@@ -1,3 +1,4 @@
+import { makeD1 } from './d1.js';
 // In-memory R2 mock for testing the config-api Worker.
 //
 // Implements the subset of the Cloudflare R2 binding interface used by
@@ -199,6 +200,7 @@ export class MockR2 {
     const AUTH_KEY = this._generateAuthKey();
     return {
       CONTENT: this,
+      AUTHDB: makeD1('migrations-auth/0001_auth_state.sql'),
       AUTH_KEY,
       ...overrides,
     };
@@ -212,14 +214,18 @@ export class MockR2 {
     return btoa(s);
   }
 
-  /** Seed auth.enc with a pre-built state object (encrypted under the env's AUTH_KEY). */
+  /** Seed the credential row (AUTHDB) with a pre-built state, encrypted under the env's AUTH_KEY. */
   async seedAuth(env, state) {
-    const { encryptState, AUTH_FILE } = await import('../../src/index.js');
+    const { encryptState } = await import('../../src/index.js');
     const blob = await encryptState(env, state);
-    await this.put(AUTH_FILE, JSON.stringify(blob), {
-      httpMetadata: { contentType: 'application/json', cacheControl: 'public, max-age=0, must-revalidate' },
-    });
+    seedAuthBlob(env, JSON.stringify(blob));
     return blob;
+  }
+
+  /** Write the PRE-D1 credential object (auth.enc in the bucket), to test the one-time import. */
+  async seedLegacyAuth(env, state) {
+    const { encryptState, AUTH_FILE } = await import('../../src/index.js');
+    await this.put(AUTH_FILE, JSON.stringify(await encryptState(env, state)));
   }
 
   /** Clear all stored objects. */
@@ -240,3 +246,13 @@ export class MockR2 {
 }
 
 export default MockR2;
+
+/** Write raw blob text into the credential row (upsert). Tests use this to seed or corrupt it. */
+export function seedAuthBlob(env, text) {
+  env.AUTHDB._sqlite
+    .prepare(
+      'INSERT INTO auth_state (id, version, blob, updated_at) VALUES (1, 1, ?, ?) ' +
+        'ON CONFLICT(id) DO UPDATE SET version = version + 1, blob = excluded.blob, updated_at = excluded.updated_at',
+    )
+    .run(text, Date.now());
+}

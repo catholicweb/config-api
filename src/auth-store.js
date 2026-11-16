@@ -1,37 +1,27 @@
 /**
- * Credential store on D1 (binding AUTHDB), instead of `auth.enc` in the PUBLIC
- * R2 bucket.
+ * Credential storage on D1 (binding AUTHDB): a single private row holding the
+ * AES-GCM blob that index.js builds ({v, iv, ct}, encrypted under AUTH_KEY),
+ * plus a `version` used for optimistic concurrency.
  *
- * index.js (and mcp-oauth.js) read and write the credential state through
- * `env.CONTENT.get/put('auth.enc')`. `withAuthStore(env)` returns an env whose
- * CONTENT is a thin proxy: every key except `auth.enc` goes straight to R2, and
- * `auth.enc` is served from / written to a single D1 row instead. index.js is
- * therefore unchanged, and without the AUTHDB binding nothing changes at all
- * (the env is returned as is).
+ * index.js (readAuthState / writeAuthState) is the only caller. This module
+ * deals in opaque blob text and never imports index.js; the two crypto steps it
+ * needs for merging are injected as `codec`.
  *
- * What this fixes:
- *  - The credential blob is no longer an object in a world-readable bucket.
- *  - Lost updates. Every request writes the WHOLE state back, so with R2 a
- *    stale writer silently overwrote concurrent changes, e.g. resurrecting a
- *    revoked editor. Here a write is a compare-and-swap on `version`; when
- *    someone else wrote first we MERGE: the diff between what this request
- *    read and what it wants to write (entry-level, and element-level for slug
- *    lists) is re-applied on top of the latest state, then retried.
- *  - Double redemption. Entries in single-use maps (`magic`, `oauth`) that this
- *    request consumed but another request already consumed make the write fail
- *    with AuthConflictError (surfaced as a 500; the second redeemer simply
- *    fails and can retry).
- *
- * The row still holds the AES-GCM blob (same format as the legacy auth.enc), so
- * AUTH_KEY remains defense in depth and the legacy object imports as is.
- * Migration is lazy: if the D1 table is empty, the first read imports the R2
- * `auth.enc` once. Delete the R2 copy afterwards (see SECURITY.md).
+ * Why not just overwrite the row? Every request reads the WHOLE state and writes
+ * the WHOLE state back. With a blind overwrite a stale request silently reverts
+ * concurrent changes (e.g. resurrects a revoked editor). So a write is a
+ * compare-and-swap on `version`; when someone else wrote first we MERGE: the diff
+ * between what this request read and what it wants to write (entry-level, and
+ * element-level for slug lists) is re-applied on top of the latest state, then
+ * retried. Entries of the single-use maps (`magic`, `oauth`) that this request
+ * consumed but another request already consumed raise AuthConflictError, so a
+ * code can't be redeemed twice concurrently.
  */
-import { AUTH_FILE, decryptState, encryptState } from './index.js';
 
 const MAX_ATTEMPTS = 6;
 const STRICT_MAPS = new Set(['magic', 'oauth']); // single-use credentials
 
+const LEGACY_KEY = 'auth.enc'; // pre-D1 location in the R2 bucket (see loadAuthBlob)
 const SCHEMA =
   'CREATE TABLE IF NOT EXISTS auth_state (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL, blob TEXT NOT NULL, updated_at INTEGER NOT NULL)';
 const ready = new WeakSet();
@@ -45,7 +35,6 @@ export class AuthConflictError extends Error {
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
-const VIRGIN = () => ({ emails: {}, tokens: {}, magic: {} });
 
 // ---- merge ------------------------------------------------------------------
 
@@ -115,121 +104,85 @@ export function applyOps(latest, ops, now = Date.now()) {
 
 // ---- store ------------------------------------------------------------------
 
-class AuthStore {
-  constructor(db, r2, env) {
-    this.db = db;
-    this.r2 = r2;
-    this.env = env;
-    this.ver = 0; // version of the row this request last read/wrote (0 = no row)
-    this.baseBlob = null; // blob text at that version
-  }
-
-  async _ensure() {
-    if (ready.has(this.db)) return;
-    await this.db.prepare(SCHEMA).run();
-    ready.add(this.db);
-  }
-
-  _row() {
-    return this.db.prepare('SELECT version, blob FROM auth_state WHERE id = 1').first();
-  }
-
-  async _decrypt(blobText) {
-    if (blobText == null) return VIRGIN();
-    try {
-      return await decryptState(this.env, JSON.parse(blobText));
-    } catch {
-      return null;
-    }
-  }
-
-  async _cas(blob, expect) {
-    const now = Date.now();
-    const r =
-      expect === 0
-        ? await this.db
-            .prepare('INSERT INTO auth_state (id, version, blob, updated_at) VALUES (1, 1, ?, ?) ON CONFLICT(id) DO NOTHING')
-            .bind(blob, now)
-            .run()
-        : await this.db
-            .prepare('UPDATE auth_state SET version = version + 1, blob = ?, updated_at = ? WHERE id = 1 AND version = ?')
-            .bind(blob, now, expect)
-            .run();
-    return r?.meta?.changes === 1;
-  }
-
-  /** Same contract as R2 `get('auth.enc')`: null, or an object with text(). */
-  async get() {
-    await this._ensure();
-    let row = await this._row();
-    if (!row) {
-      // One-time lazy import of the legacy R2 object.
-      const legacy = await this.r2.get(AUTH_FILE);
-      if (legacy) {
-        const text = await legacy.text();
-        await this.db
-          .prepare('INSERT OR IGNORE INTO auth_state (id, version, blob, updated_at) VALUES (1, 1, ?, ?)')
-          .bind(text, Date.now())
-          .run();
-        row = await this._row();
-      }
-    }
-    if (!row) {
-      this.ver = 0;
-      this.baseBlob = null;
-      return null;
-    }
-    this.ver = row.version;
-    this.baseBlob = row.blob;
-    return { text: async () => row.blob };
-  }
-
-  /** Same contract as R2 `put('auth.enc', json)`. */
-  async put(value) {
-    await this._ensure();
-    const nextBlob = typeof value === 'string' ? value : await new Response(value).text();
-    let blob = nextBlob;
-    let expect = this.ver;
-    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-      if (await this._cas(blob, expect)) {
-        this.ver = expect + 1;
-        this.baseBlob = blob;
-        return;
-      }
-      // Somebody wrote since we read: merge our change onto the latest state.
-      const latest = await this._row();
-      if (!latest) {
-        expect = 0;
-        blob = nextBlob;
-        continue;
-      }
-      const [base, next, cur] = await Promise.all([
-        this._decrypt(this.baseBlob),
-        this._decrypt(nextBlob),
-        this._decrypt(latest.blob),
-      ]);
-      if (!base || !next || !cur) throw new Error('auth state unreadable during merge');
-      applyOps(cur, diffStates(base, next));
-      const enc = await encryptState(this.env, cur);
-      if (!enc) throw new Error('auth encryption key not configured');
-      blob = JSON.stringify(enc);
-      expect = latest.version;
-    }
-    throw new AuthConflictError('auth state is busy; retry');
-  }
+async function ensureSchema(db) {
+  if (ready.has(db)) return;
+  await db.prepare(SCHEMA).run();
+  ready.add(db);
 }
 
-/** env whose CONTENT serves `auth.enc` from D1. Returns env unchanged without an AUTHDB binding. */
-export function withAuthStore(env) {
-  if (!env?.AUTHDB || !env.CONTENT) return env;
-  const store = new AuthStore(env.AUTHDB, env.CONTENT, env);
-  const bucket = new Proxy(env.CONTENT, {
-    get(target, prop) {
-      if (prop === 'get') return (key, opts) => (key === AUTH_FILE ? store.get() : target.get(key, opts));
-      if (prop === 'put') return (key, value, opts) => (key === AUTH_FILE ? store.put(value) : target.put(key, value, opts));
-      const v = Reflect.get(target, prop, target);
-      return typeof v === 'function' ? v.bind(target) : v;
-    },
-  });
-  return { ...env, CONTENT: bucket };
+const readRow = (db) => db.prepare('SELECT version, blob FROM auth_state WHERE id = 1').first();
+
+async function cas(db, blob, expect) {
+  const now = Date.now();
+  const r =
+    expect === 0
+      ? await db
+          .prepare('INSERT INTO auth_state (id, version, blob, updated_at) VALUES (1, 1, ?, ?) ON CONFLICT(id) DO NOTHING')
+          .bind(blob, now)
+          .run()
+      : await db
+          .prepare('UPDATE auth_state SET version = version + 1, blob = ?, updated_at = ? WHERE id = 1 AND version = ?')
+          .bind(blob, now, expect)
+          .run();
+  return r?.meta?.changes === 1;
+}
+
+/**
+ * Current credential blob: { version, blob } where blob is the JSON text of the
+ * encrypted state, or null (version 0) when nothing has been stored yet.
+ */
+export async function loadAuthBlob(env) {
+  const db = env.AUTHDB;
+  await ensureSchema(db);
+  let row = await readRow(db);
+  if (!row) {
+    // TEMPORARY one-time import of the pre-D1 object. Delete this block (and
+    // LEGACY_KEY) once auth.enc has been removed from the R2 bucket.
+    const legacy = await env.CONTENT?.get(LEGACY_KEY);
+    if (legacy) {
+      await db
+        .prepare('INSERT OR IGNORE INTO auth_state (id, version, blob, updated_at) VALUES (1, 1, ?, ?)')
+        .bind(await legacy.text(), Date.now())
+        .run();
+      row = await readRow(db);
+    }
+  }
+  return row ? { version: row.version, blob: row.blob } : { version: 0, blob: null };
+}
+
+/**
+ * Store `nextBlob` (JSON text) that was derived from `base` (what loadAuthBlob
+ * returned for this request). Returns the new base. Merges onto concurrent
+ * writes; throws AuthConflictError if it can't (single-use code already used,
+ * or too much contention).
+ *
+ * codec = { decrypt(text) -> state | null, encrypt(state) -> text | null }
+ */
+export async function saveAuthBlob(env, base, nextBlob, codec) {
+  const db = env.AUTHDB;
+  await ensureSchema(db);
+  let blob = nextBlob;
+  let expect = base.version;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    if (await cas(db, blob, expect)) return { version: expect + 1, blob };
+    // Somebody wrote since we read: merge our change onto the latest state.
+    const latest = await readRow(db);
+    if (!latest) {
+      expect = 0;
+      blob = nextBlob;
+      continue;
+    }
+    const empty = () => ({ emails: {}, tokens: {}, magic: {} });
+    const [was, want, cur] = await Promise.all([
+      base.blob == null ? empty() : codec.decrypt(base.blob),
+      codec.decrypt(nextBlob),
+      codec.decrypt(latest.blob),
+    ]);
+    if (!was || !want || !cur) throw new Error('auth state unreadable during merge');
+    applyOps(cur, diffStates(was, want));
+    blob = await codec.encrypt(cur);
+    if (!blob) throw new Error('auth encryption key not configured');
+    expect = latest.version;
+  }
+  throw new AuthConflictError('auth state is busy; retry');
 }

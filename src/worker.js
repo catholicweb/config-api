@@ -7,7 +7,6 @@ import * as oauth from './mcp-oauth.js';
 import { handleRegister, listRegistrations, purgeRegistrations } from './registration.js';
 import { handleSubscription } from './registration-notify.js';
 import { guardRequest } from './guards.js';
-import { withAuthStore } from './auth-store.js';
 
 // Decode each path segment like index.js does (a decoded segment may not contain '/').
 function decodeSegments(pathname) {
@@ -29,8 +28,6 @@ async function guardedBase(request, env, ctx) {
 export default {
   ...base,
   async fetch(request, env, ctx) {
-    // Credentials live in D1 (AUTHDB) when bound, not in the public bucket.
-    env = withAuthStore(env);
     const url = new URL(request.url);
     const p = url.pathname;
     const m = request.method.toUpperCase();

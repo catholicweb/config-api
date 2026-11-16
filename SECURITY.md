@@ -41,21 +41,21 @@ ones.
 
 ## Credential store (`src/auth-store.js`, D1 binding `AUTHDB`)
 
-Credentials no longer live in `auth.enc` in the public bucket. `worker.js` wraps
-`env` with `withAuthStore`: `env.CONTENT` serves/writes the key `auth.enc` from a
-single private D1 row and passes every other key to R2, so `index.js` is
-unchanged. The row holds the same AES-GCM blob (AUTH_KEY stays as defense in
-depth). Without the binding nothing changes.
+Credentials no longer live in `auth.enc` in the public bucket. `readAuthState` /
+`writeAuthState` (index.js) read and write ONE private D1 row holding the same
+AES-GCM blob (AUTH_KEY stays as defense in depth). `auth-store.js` owns the
+storage and merge logic. AUTHDB is required: without it auth answers 503.
 
 - **No lost updates**: writes are compare-and-swap on `version`. If someone wrote
   first, the request's change (diff between what it read and what it wants to
   write; element-wise for slug lists) is re-applied on the latest state and
   retried. A stale request can no longer resurrect a revoked editor.
 - **Single-use codes**: consuming a `magic`/`oauth` entry that another request
-  already consumed fails with `AuthConflictError` (HTTP 500), so a code can't be
-  redeemed twice concurrently.
+  already consumed fails (`{ ok:false }`, 503), so a code can't be redeemed
+  twice concurrently.
 - **Migration**: lazy. When the D1 table is empty, the first read imports the R2
-  `auth.enc` once; D1 is the source of truth from then on.
+  `auth.enc` once (a temporary block in `loadAuthBlob`; delete it, and the
+  `AUTH_FILE` skip in `backfillCache`, once the R2 object is gone).
 
 Rollout: (1) `wrangler d1 create parroquia-auth`, paste the id in `wrangler.toml`;
 (2) `wrangler d1 migrations apply parroquia-auth --remote`; (3) merge/deploy and
