@@ -76,6 +76,14 @@ workers_dev = false
 #   (optional var) REG_RETENTION_DAYS               # registrations are deleted this many days after their
 #                                                   # last update by the daily cron (default 365)
 #
+# Secret required for the site traffic summary emails (src/site-stats.js):
+#
+#   npx wrangler secret put CF_ANALYTICS_TOKEN      # Cloudflare API token with read-only
+#                                                   #   Account > Account Analytics: Read  (Web Analytics beacon) and
+#                                                   #   Zone > Analytics: Read             (raw requests, zone parroquia.app)
+#                                                   # CLOUDFLARE_API_TOKEN (DNS/Pages edit) does NOT have these.
+#                                                   # Without it the stats job does nothing.
+#
 # For local dev, put them in .dev.vars instead (gitignored).
 
 # Non-secret: where the emailed magic link points (the editor magic-link landing
@@ -87,6 +95,15 @@ MAGIC_LINK_BASE = "https://editor.parroquia.app/magic"
 # builds every media/list absolute URL from this. Defaults to
 # https://data.parroquia.app when unset, mirroring MAGIC_LINK_BASE.
 DATA_BASE = "https://data.parroquia.app"
+
+# Site traffic summary emails (src/site-stats.js), run by the daily cron:
+#   "test" = every day ONE email to STATS_TEST_EMAIL (one site, last 30 days, rotating
+#            through the sites, with a developer diagnostics block); editors get nothing.
+#   "live" = on the 1st of each month, last month's report to each site's main editor.
+#   "off"  = disabled.
+# Optional: STATS_TEST_SLUG pins the site used in test mode.
+STATS_REPORT_MODE = "test"
+STATS_TEST_EMAIL = "arrietaeguren@gmail.com"
 
 [[r2_buckets]]
 binding = "CONTENT"

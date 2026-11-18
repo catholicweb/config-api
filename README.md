@@ -505,6 +505,8 @@ to send topic messages for tomorrow's calendar events to each site's
 `repo` scope; not recommended). Enables [Auto-build](#auto-build) on `config.json`
 writes; when unset the feature is off and saves still work.
 
+Optional secret `CF_ANALYTICS_TOKEN` enables the [Site stats emails](#site-stats-emails).
+
 Optional non-secret var: `MAGIC_LINK_BASE` (default
 `https://editor.parroquia.app/magic`). For local dev, put them in gitignored
 `.dev.vars`. See `wrangler.toml` comments.
@@ -517,6 +519,42 @@ Optional non-secret var: `MAGIC_LINK_BASE` (default
 > There is **no migration** — `auth.enc` is created lazily on the first write. The
 > worker also no longer reads or deletes legacy `auth.json`/`magic.json`/`emails.json`;
 > delete them manually if any remain in the bucket.
+
+## Site stats emails
+
+`src/site-stats.js`, run by the daily cron (after the registrations purge), emails each
+site's **main editor** a traffic summary: visits, page views, a per-day chart, top
+pages, where visitors come from, countries, devices and most downloaded PDFs, each
+compared with the previous period. Pure HTML/CSS (no images, no JS) so it renders in
+any mail client. Controlled by the `STATS_REPORT_MODE` var:
+
+| Mode | What happens |
+|------|--------------|
+| `test` (default) | Every day ONE email to `STATS_TEST_EMAIL`: one site (rotating through `slugs.json`, or `STATS_TEST_SLUG`), last 30 days, plus a developer-only block comparing beacon and raw requests. Editors get nothing. If the Cloudflare query fails, the error is emailed instead. |
+| `live` | On the 1st of each month (UTC), last calendar month to the main editor of every site. Sites without beacon data are skipped. |
+| `off` | Disabled. |
+
+**Main editor** = the first email granted on the slug in the credential state (the owner
+seeded at site creation; `mainEditor()`). Transferring an editor re-adds it at the end.
+
+**Data** (Cloudflare GraphQL Analytics API; secret `CF_ANALYTICS_TOKEN`, read-only
+`Account Analytics: Read` + `Zone Analytics: Read`):
+
+- Visits, page views, pages, referrers, countries and devices come **only** from the
+  Web Analytics beacon (`rumPageloadEventsAdaptiveGroups`), filtered to the site's own
+  hostnames (`<slug>.parroquia.app` + the host of `dev.siteurl`). Raw requests are never
+  mixed into those numbers: they include crawlers, js/css/images/json, `robots.txt`,
+  `sitemap.xml`... Paths are also cleaned (`isNoisePath`: files with an extension,
+  `/assets`, `/404`, `.well-known`, `cdn-cgi`...; `.html`/trailing slash normalized) and
+  visits from the site itself are not counted as a referrer.
+- Raw zone requests (`httpRequestsAdaptiveGroups`) only feed the PDF downloads from the
+  data host and the test-mode diagnostics.
+- Windows are split in 15-day chunks (adaptive datasets allow 30 days per query).
+- Adding a source (e.g. Google Search Console): write a collector
+  `async (env, sites, range) => Map<slug, data>`, add it to `SOURCES`, render its section
+  in `buildReport()`. A failing optional source only drops its section.
+
+To try it locally: `npx wrangler dev --test-scheduled`, then `curl "http://localhost:8787/__scheduled"`.
 
 ## opus-youtube-subscriptions
 Config.json may include `info.social` with YouTube channels. The worker tracks
