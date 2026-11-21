@@ -15,6 +15,7 @@ import {
   chunkRange,
   pctChange,
   runStatsReport,
+  testSlugs,
 } from '../../src/site-stats.js';
 import { MockR2, makeTestEnv } from '../helpers/integration.js';
 
@@ -187,7 +188,7 @@ function dataset(octDay = '2026-10-12', novDay = '2026-11-10') {
 async function setup(extraEnv = {}) {
   const r2 = new MockR2();
   const env = await makeTestEnv(r2);
-  Object.assign(env, { CF_ANALYTICS_TOKEN: 't', CLOUDFLARE_ACCOUNT_ID: TAG, CLOUDFLARE_ZONE_ID: 'b'.repeat(32), RESEND_API_KEY: 're', STATS_SEND_DELAY_MS: 0, ...extraEnv });
+  Object.assign(env, { CF_ANALYTICS_TOKEN: 't', CLOUDFLARE_ACCOUNT_ID: TAG, CLOUDFLARE_ZONE_ID: 'b'.repeat(32), RESEND_API_KEY: 're', STATS_SEND_DELAY_MS: 0, STATS_TEST_SLUGS: 'demo,otra,sineditor', ...extraEnv });
   await r2.put('slugs.json', JSON.stringify({ slugs: ['demo', 'otra', 'sineditor'] }));
   await r2.put('demo/config.json', JSON.stringify({ info: { title: 'Parroquia Demo' }, dev: { siteurl: 'https://www.demoparroquia.es' } }));
   await r2.put('otra/config.json', JSON.stringify({ title: 'Otra' }));
@@ -302,5 +303,27 @@ describe('runStatsReport', () => {
     vi.stubGlobal('fetch', async () => Response.json({ data: null, errors: [{ message: 'boom' }] }));
     await expect(runStatsReport(env, new Date('2026-11-01T18:00:00Z'))).rejects.toThrow('boom');
     expect(sent).toHaveLength(0);
+  });
+
+  it('test mode only loops over the configured slugs', async () => {
+    const env = await setup({ STATS_REPORT_MODE: 'test', STATS_TEST_EMAIL: 'dev@x.org', STATS_TEST_SLUGS: 'Otra' });
+    stubCloudflare(dataset());
+    for (const d of ['2026-11-18', '2026-11-19', '2026-11-20']) {
+      expect((await runStatsReport(env, new Date(`${d}T18:00:00Z`))).slug).toBe('otra');
+    }
+  });
+
+  it('test mode does nothing when none of the configured slugs exists', async () => {
+    const env = await setup({ STATS_REPORT_MODE: 'test', STATS_TEST_EMAIL: 'dev@x.org', STATS_TEST_SLUGS: 'nope' });
+    stubCloudflare(dataset());
+    expect(await runStatsReport(env, new Date('2026-11-18T18:00:00Z'))).toEqual({ skipped: 'no test slugs found' });
+    expect(sent).toHaveLength(0);
+  });
+});
+
+describe('test slugs', () => {
+  it('match ignoring case, accents and separators; defaults to the four dev sites', () => {
+    expect(testSlugs({ STATS_TEST_SLUGS: 'corazón Vicenta, 47herri' }, ['corazon-vicenta', '47herri', 'otra'])).toEqual(['corazon-vicenta', '47herri']);
+    expect(testSlugs({}, ['bidaso', 'vocacion', 'corazonvicenta', '47herri', 'x'])).toEqual(['bidaso', 'vocacion', 'corazonvicenta', '47herri']);
   });
 });

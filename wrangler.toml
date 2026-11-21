@@ -22,6 +22,7 @@ workers_dev = false
 #
 #   npx wrangler secret put ADMIN_TOKEN_HASH        # sha256 hex of your admin token
 #   npx wrangler secret put CLOUDFLARE_API_TOKEN    # API token with Zone.DNS:Edit + Account.Pages:Edit
+#                                                   # + Account > Web Analytics: Edit (installs the visit counter beacon on every site)
 #   npx wrangler secret put CLOUDFLARE_ACCOUNT_ID   # Cloudflare account ID
 #   npx wrangler secret put CLOUDFLARE_ZONE_ID      # Zone ID for parroquia.app
 #
@@ -104,6 +105,8 @@ DATA_BASE = "https://data.parroquia.app"
 # Optional: STATS_TEST_SLUG pins the site used in test mode.
 STATS_REPORT_MODE = "test"
 STATS_TEST_EMAIL = "arrietaeguren@gmail.com"
+# Test mode only loops over these slugs (comma-separated; case, accents and separators are ignored).
+STATS_TEST_SLUGS = "corazon-vicenta,47herri,bidaso,vocacion"
 
 [[r2_buckets]]
 binding = "CONTENT"
