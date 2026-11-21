@@ -7,7 +7,7 @@ import * as oauth from './mcp-oauth.js';
 import { handleRegister, listRegistrations, purgeRegistrations } from './registration.js';
 import { handleSubscription } from './registration-notify.js';
 import { guardRequest } from './guards.js';
-import { runStatsReport } from './site-stats.js';
+import { runStatsReport, runStatsMaintenance } from './site-stats.js';
 
 // Decode each path segment like index.js does (a decoded segment may not contain '/').
 function decodeSegments(pathname) {
@@ -87,6 +87,13 @@ export default {
       console.log('scheduled: registrations purged:', r.deleted);
     } catch (err) {
       console.error('scheduled: purgeRegistrations failed:', err);
+    }
+    // Beacon check + long-term archive of the traffic numbers (before the report, so yesterday is already archived).
+    try {
+      const r = await runStatsMaintenance(env);
+      console.log('scheduled: site stats maintenance:', JSON.stringify(r));
+    } catch (err) {
+      console.error('scheduled: runStatsMaintenance failed:', err);
     }
     // Site traffic summary emails (src/site-stats.js): test mode daily, live mode on the 1st.
     try {

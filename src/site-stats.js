@@ -33,6 +33,11 @@
  */
 import { readAuthState } from './index.js';
 import { esc, sendRegistrationEmail } from './registration.js';
+import { ensureBeacons } from './web-analytics.js';
+import { getMeta, setMeta, saveDaily, loadDaily, addMonthly, loadMonthly, purgeOld } from './stats-archive.js';
+
+// Free Cloudflare plan: Web Analytics keeps about a month; older numbers come from the archive (src/stats-archive.js).
+const RETENTION_DAYS = 30;
 
 const GQL_URL = 'https://api.cloudflare.com/client/v4/graphql';
 const DAY = 86400000;
@@ -242,7 +247,13 @@ async function collectRum(env, sites, range) {
 
   const [daily, prevDaily, pageRows, refRows, countryRows, deviceRows] = await Promise.all([
     rumRows(env, hosts, 'date', range.start, range.end),
-    rumRows(env, hosts, 'date', range.prevStart, range.prevEnd),
+    // The previous period may be older than what Cloudflare still serves: then the archive provides it (see mergeArchive).
+    range.skipPrev
+      ? []
+      : rumRows(env, hosts, 'date', range.prevStart, range.prevEnd).catch((e) => {
+          console.error('site-stats: previous period not served by Cloudflare:', e?.message);
+          return [];
+        }),
     rumRows(env, hosts, 'requestPath', range.start, range.end),
     rumRows(env, hosts, 'refererHost', range.start, range.end),
     rumRows(env, hosts, 'countryName', range.start, range.end),
@@ -309,7 +320,68 @@ async function collectRum(env, sites, range) {
     a.countries = top(t.countries, 6).map(([name, views]) => ({ name, views }));
     a.devices = Object.fromEntries(t.devices);
   }
+  if (env.REGDB && !range.skipArchive) {
+    try {
+      await mergeArchive(env.REGDB, range, acc);
+    } catch (e) {
+      console.error('site-stats: archive unavailable:', e?.message);
+    }
+  }
   return acc;
+}
+
+/** Fill what Cloudflare no longer serves from the archive: missing days, the previous period, and (month reports) the month's breakdowns. */
+async function mergeArchive(db, range, acc) {
+  const first = await getMeta(db, 'first_day');
+  const last = await getMeta(db, 'last_day');
+  if (!first || !last) return;
+
+  for (const r of await loadDaily(db, isoDate(range.start), isoDate(range.end))) {
+    const a = acc.get(r.slug);
+    const day = a?.daily.find((d) => d.date === r.day);
+    if (day && !day.views && r.views) {
+      day.views = r.views;
+      day.visits = r.visits;
+      a.views += r.views;
+      a.visits += r.visits;
+    }
+  }
+
+  if (!range.skipPrev && isoDate(range.prevStart) >= first && isoDate(range.prevEnd - DAY) <= last) {
+    const prev = new Map();
+    for (const r of await loadDaily(db, isoDate(range.prevStart), isoDate(range.prevEnd))) {
+      const t = prev.get(r.slug) || { views: 0, visits: 0 };
+      t.views += r.views;
+      t.visits += r.visits;
+      prev.set(r.slug, t);
+    }
+    for (const [slug, a] of acc) {
+      const t = prev.get(slug);
+      if (t && !a.prevViews) {
+        a.prevViews = t.views;
+        a.prevVisits = t.visits;
+      }
+    }
+  }
+
+  // A whole archived month beats what the beacon still serves for its first days.
+  const dimsFirst = await getMeta(db, 'dims_first_day');
+  if (range.kind === 'month' && dimsFirst && isoDate(range.start) >= dimsFirst) {
+    const bySlug = new Map();
+    for (const r of await loadMonthly(db, isoDate(range.start).slice(0, 7))) {
+      if (!bySlug.has(r.slug)) bySlug.set(r.slug, []);
+      bySlug.get(r.slug).push(r);
+    }
+    for (const [slug, a] of acc) {
+      const rs = bySlug.get(slug);
+      if (!rs?.some((r) => r.kind === 'page')) continue;
+      const pick = (kind, n) => rs.filter((r) => r.kind === kind).sort((x, y) => y.views - x.views).slice(0, n);
+      a.pages = pick('page', 10).map((r) => ({ path: r.key, views: r.views }));
+      a.referrers = { cats: Object.fromEntries(pick('refcat', 9).map((r) => [r.key, r.views])), hosts: pick('refhost', 5).map((r) => ({ host: r.key, views: r.views })) };
+      a.countries = pick('country', 6).map((r) => ({ name: r.key, views: r.views }));
+      a.devices = Object.fromEntries(pick('device', 9).map((r) => [r.key, r.views]));
+    }
+  }
 }
 
 /** PDF downloads served from the data host (/<slug>/<file>). Raw requests, so approximate. */
@@ -568,6 +640,16 @@ ${row('Crudas: HTML 200 sin ruido', nf(d.html200Clean))}
 
 const sleep = (ms) => (ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve());
 
+// Dev (test) mode only loops over these sites. Names are compared ignoring case, accents and separators,
+// so 'corazón Vicenta' matches the slug 'corazon-vicenta'. Override with the STATS_TEST_SLUGS var (comma-separated).
+export const DEFAULT_TEST_SLUGS = ['corazon-vicenta', '47herri', 'bidaso', 'vocacion'];
+const normSlug = (s) => String(s ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]/g, '');
+
+export function testSlugs(env, slugs) {
+  const wanted = String(env.STATS_TEST_SLUGS ?? DEFAULT_TEST_SLUGS.join(',')).split(',').map(normSlug).filter(Boolean);
+  return slugs.filter((s) => wanted.includes(normSlug(s)));
+}
+
 async function readSlugs(env) {
   const obj = await env.CONTENT.get('slugs.json');
   if (!obj) return [];
@@ -639,7 +721,12 @@ export async function runStatsReport(env, now = new Date()) {
   // test mode: one site, last 30 days, to the developer only.
   const to = env.STATS_TEST_EMAIL;
   if (!to) return { skipped: 'STATS_TEST_EMAIL not set' };
-  const slug = slugs.includes(env.STATS_TEST_SLUG) ? env.STATS_TEST_SLUG : slugs[dayOfYear(now) % slugs.length];
+  const pool = testSlugs(env, slugs);
+  if (!pool.length && !slugs.includes(env.STATS_TEST_SLUG)) {
+    console.log('site-stats: none of the test slugs (STATS_TEST_SLUGS) exist; nothing to do');
+    return { skipped: 'no test slugs found' };
+  }
+  const slug = slugs.includes(env.STATS_TEST_SLUG) ? env.STATS_TEST_SLUG : pool[dayOfYear(now) % pool.length];
   const range = rollingRange(now, 30);
   const site = await loadSite(env, slug);
   try {
@@ -656,4 +743,102 @@ export async function runStatsReport(env, now = new Date()) {
     await sendWithRetry(env, to, { subject: `[Prueba] Error generando el informe de ${slug}`, text: msg, html: `<pre style="font-family:monospace;white-space:pre-wrap;">${esc(msg)}</pre>` });
     return { sent: 0, slug, error: String(e?.message || e) };
   }
+}
+
+// ---------------------------------------------------------------------------
+// Maintenance (daily cron, independent of STATS_REPORT_MODE): beacon check + archive
+// ---------------------------------------------------------------------------
+
+/**
+ * Archive the numbers Cloudflare will forget: daily totals of the last days (idempotent: the last
+ * few days are re-saved) and, once per day, yesterday's top entries added into the month's breakdowns.
+ */
+export async function archiveStats(env, sites, now = new Date()) {
+  const db = env.REGDB;
+  if (!db) return { skipped: 'REGDB not bound' };
+  const today = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  const yesterday = today - DAY;
+  const last = await getMeta(db, 'last_day');
+  const from = last ? Math.max(today - RETENTION_DAYS * DAY, Date.parse(last) - 2 * DAY) : today - RETENTION_DAYS * DAY;
+
+  const hostToSlug = new Map();
+  for (const s of sites) for (const h of s.hosts) hostToSlug.set(h, s.slug);
+  const rows = await rumRows(env, [...hostToSlug.keys()], 'date', from, today);
+  const per = new Map();
+  for (const r of rows) {
+    const slug = hostToSlug.get(String(r.dimensions.requestHost || '').toLowerCase());
+    if (!slug) continue;
+    const k = `${slug}|${r.dimensions.date}`;
+    const t = per.get(k) || { slug, day: r.dimensions.date, views: 0, visits: 0 };
+    t.views += r.count || 0;
+    t.visits += r.sum?.visits || 0;
+    per.set(k, t);
+  }
+  await saveDaily(db, [...per.values()]);
+  await setMeta(db, 'first_day', isoDate(from), { ifAbsent: true });
+  await setMeta(db, 'last_day', isoDate(yesterday));
+
+  let dimRows = 0;
+  const lastDims = await getMeta(db, 'last_dims_day');
+  if (!lastDims || lastDims < isoDate(yesterday)) {
+    const rum = await collectRum(env, sites, { start: yesterday, end: today, prevStart: yesterday, prevEnd: yesterday, skipPrev: true, skipArchive: true });
+    const items = [];
+    for (const s of sites) {
+      const a = rum.get(s.slug);
+      if (!a) continue;
+      const add = (kind, key, views) => views > 0 && items.push({ slug: s.slug, kind, key, views });
+      for (const p of a.pages) add('page', p.path, p.views);
+      for (const [k, v] of Object.entries(a.referrers.cats)) add('refcat', k, v);
+      for (const h of a.referrers.hosts) add('refhost', h.host, h.views);
+      for (const c of a.countries) add('country', c.name, c.views);
+      for (const [k, v] of Object.entries(a.devices)) add('device', k, v);
+    }
+    await addMonthly(db, isoDate(yesterday).slice(0, 7), items);
+    await setMeta(db, 'last_dims_day', isoDate(yesterday));
+    await setMeta(db, 'dims_first_day', isoDate(yesterday), { ifAbsent: true });
+    dimRows = items.length;
+  }
+  await purgeOld(db, now);
+  return { days: per.size, dimRows };
+}
+
+async function notifyBeacons(env, b, now) {
+  const to = env.STATS_TEST_EMAIL;
+  if (!to || !env.RESEND_API_KEY) return;
+  // Only mail the developer when something changed, or weekly (Mondays) while something keeps failing.
+  if (!b.created.length && !(b.failed.length && now.getUTCDay() === 1)) return;
+  const list = (title, items) => (items.length ? ['', title, ...items.map((i) => `  - ${i}`)] : []);
+  const text = [
+    `Contador de visitas (Cloudflare Web Analytics): ${b.ok.length} ya instalados, ${b.created.length} instalados ahora, ${b.failed.length} con error, ${b.external.length} dominios propios sin contador, ${b.pending.length} pendientes.`,
+    ...list('Instalados ahora', b.created),
+    ...list('Con error', b.failed.map((f) => `${f.host}: ${f.error}`)),
+    ...list('Dominios propios (hay que añadir el snippet en la web)', b.external),
+    ...list('Pendientes (mañana)', b.pending),
+  ].join('\n');
+  await sendWithRetry(env, to, { subject: '[Prueba] Estado del contador de visitas', text, html: `<pre style="font-family:monospace;white-space:pre-wrap;">${esc(text)}</pre>` });
+}
+
+/** Daily: make sure every site hostname has the beacon, then archive the numbers. Each step fails on its own. */
+export async function runStatsMaintenance(env, now = new Date()) {
+  if (!env.CF_ANALYTICS_TOKEN || !env.CLOUDFLARE_ACCOUNT_ID || !env.CLOUDFLARE_ZONE_ID) return { skipped: 'not configured' };
+  const slugs = await readSlugs(env);
+  if (!slugs.length) return { skipped: 'no sites' };
+  const sites = [];
+  for (const slug of slugs) sites.push(await loadSite(env, slug));
+  const out = {};
+  try {
+    const b = await ensureBeacons(env, [...new Set(sites.flatMap((s) => [...s.hosts]))]);
+    out.beacons = { ok: b.ok.length, created: b.created, failed: b.failed, external: b.external, pending: b.pending.length, skipped: b.skipped };
+    await notifyBeacons(env, b, now);
+  } catch (e) {
+    out.beaconError = String(e?.message || e);
+    console.error('site-stats: beacon check failed:', e);
+  }
+  try {
+    out.archive = await archiveStats(env, sites, now);
+  } catch (e) {
+    out.archiveError = String(e?.message || e);
+    console.error('site-stats: archive failed:', e);
+  }
+  return out;
 }

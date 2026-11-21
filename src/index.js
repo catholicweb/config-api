@@ -24,6 +24,7 @@
 // (could be regarded as a part of the same inter-dependency contract):
 // applyPatch applies the editor's diff ops onto the stored doc.
 import { applyPatch } from './patch.js';
+import { ensureBeacons } from './web-analytics.js';
 import { loadAuthBlob, saveAuthBlob, AuthConflictError } from './auth-store.js';
 import { scheduled as sendNotificationsCron, getGoogleAccessToken } from './notifications.js';
 
@@ -1390,6 +1391,10 @@ async function createSite(ctx, env, slug, email) {
   // fails — a fresh site's build is harmless and the seed is what matters.
   if (ctx?.waitUntil) {
     ctx.waitUntil(githubDispatch(env, slug));
+    // Visit counter (Web Analytics beacon) for the new hostname; best-effort, the daily cron retries.
+    ctx.waitUntil(
+      ensureBeacons(env, [`${slug}.parroquia.app`]).catch((e) => console.log(`createSite: beacon install failed for ${slug}: ${e?.message}`)),
+    );
   }
 
   // Grant the owner editor access (the encrypted email allowlist is the enforced
