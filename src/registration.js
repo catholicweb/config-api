@@ -49,6 +49,8 @@ export const LIMITS = {
   label: 200,
   eventKey: 120,
   people: 500,
+  extra: 20,
+  extraValue: 1000,
   token: 2048,
 };
 // Max registrations created per email address per hour (mail-bombing guard).
@@ -190,6 +192,20 @@ export async function verifyTurnstile(env, token, ip, hostnames) {
 
 const str = (v, max) => (typeof v === 'string' ? v.trim().slice(0, max) : '');
 
+// Answers to the event's optional extra questions: [{ id, label, value }] (value: string or boolean).
+// Stored inside the encrypted blob, so no DB migration. undefined when the client sent none.
+function cleanExtra(v) {
+  if (!Array.isArray(v)) return undefined;
+  return v
+    .slice(0, LIMITS.extra)
+    .map((e) => ({
+      id: str(e?.id, 64),
+      label: str(e?.label, LIMITS.label),
+      value: typeof e?.value === 'boolean' ? e.value : str(e?.value, LIMITS.extraValue),
+    }))
+    .filter((e) => e.id && e.label && e.value !== '');
+}
+
 // Returns { ok, fields } or { ok:false, error }.
 export function validateFields(d) {
   const name = str(d.name, LIMITS.name);
@@ -197,13 +213,14 @@ export function validateFields(d) {
   const email = str(d.email, LIMITS.email);
   const notes = str(d.notes, LIMITS.notes);
   const people = Number(d.people);
+  const extra = cleanExtra(d.extra);
   if (!name) return { ok: false, error: 'name is required' };
   if (!phone || !/^[+()\d\s.\-]{5,}$/.test(phone)) return { ok: false, error: 'a valid phone is required' };
   if (!validateEmail(email)) return { ok: false, error: 'a valid email is required' };
   if (!Number.isInteger(people) || people < 1 || people > LIMITS.people) {
     return { ok: false, error: `people must be a whole number between 1 and ${LIMITS.people}` };
   }
-  return { ok: true, fields: { name, phone, email: normalizeEmail(email), people, notes } };
+  return { ok: true, fields: { name, phone, email: normalizeEmail(email), people, notes, ...(extra ? { extra } : {}) } };
 }
 
 const validEventKey = (k) => typeof k === 'string' && /^[A-Za-z0-9_.:-]{1,120}$/.test(k);
@@ -243,10 +260,12 @@ const STRINGS = {
 };
 
 export function buildEmail(lang, { eventLabel, fields, link }) {
+  const answer = (v, en) => (v === true ? (en ? 'Yes' : 'Sí') : v === false ? 'No' : String(v));
   const t = STRINGS[String(lang || '').toLowerCase().startsWith('en') ? 'en' : 'es'];
   const rows = [
     [t.event, eventLabel], [t.name, fields.name], [t.phone, fields.phone],
     [t.email, fields.email], [t.people, String(fields.people)], [t.notes, fields.notes || '—'],
+    ...(fields.extra || []).map((e) => [e.label, answer(e.value, t === STRINGS.en)]),
   ];
   const text = `${t.hello(fields.name)}\n\n${t.intro}\n\n`
     + rows.map(([k, v]) => `${k}: ${v}`).join('\n')
@@ -393,7 +412,7 @@ async function getRegistration(env, id, url) {
     site: row.site,
     event: row.event_key,
     eventLabel: row.event_label,
-    name: data.name, phone: data.phone, email: data.email, people: data.people, notes: data.notes,
+    name: data.name, phone: data.phone, email: data.email, people: data.people, notes: data.notes, extra: data.extra || [],
   });
 }
 
@@ -408,7 +427,7 @@ async function updateRegistration(env, id, request, ctx) {
   if (!keys) return json({ error: 'registrations not configured' }, 503);
   const prev = await open(keys, row.site, id, row);
   const f = checked.fields;
-  const sealed = await seal(keys, row.site, id, { ...f, lang: prev?.lang || '' });
+  const sealed = await seal(keys, row.site, id, { ...f, extra: f.extra ?? prev?.extra ?? [], lang: prev?.lang || '' });
   await db(env)
     .prepare('UPDATE registrations SET people = ?, email_hmac = ?, iv = ?, data = ?, updated_at = ? WHERE id = ?')
     .bind(f.people, await emailDigest(keys, f.email), sealed.iv, sealed.data, Date.now(), id)
@@ -468,13 +487,13 @@ export async function listRegistrations(env, slug, url) {
     items.push({
       id: row.id, event: row.event_key, eventLabel: row.event_label,
       createdAt: row.created_at, updatedAt: row.updated_at,
-      name: data.name, phone: data.phone, email: data.email, people: row.people, notes: data.notes,
+      name: data.name, phone: data.phone, email: data.email, people: row.people, notes: data.notes, extra: data.extra || [],
     });
   }
   if (url.searchParams.get('format') === 'csv') {
-    const head = ['event', 'eventLabel', 'createdAt', 'name', 'phone', 'email', 'people', 'notes'];
+    const head = ['event', 'eventLabel', 'createdAt', 'name', 'phone', 'email', 'people', 'notes', 'extra'];
     const lines = [head.join(',')].concat(
-      items.map((i) => head.map((h) => csvCell(h === 'createdAt' ? new Date(i.createdAt).toISOString() : i[h])).join(',')),
+      items.map((i) => head.map((h) => csvCell(h === 'createdAt' ? new Date(i.createdAt).toISOString() : h === 'extra' ? (i.extra || []).map((e) => `${e.label}: ${e.value}`).join(' | ') : i[h])).join(',')),
     );
     return new Response(lines.join('\n') + '\n', {
       headers: { 'Content-Type': 'text/csv; charset=utf-8', 'Cache-Control': 'no-store' },
