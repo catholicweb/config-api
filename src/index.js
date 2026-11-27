@@ -37,6 +37,8 @@ import { scheduled as sendNotificationsCron, getGoogleAccessToken } from './noti
  *                              ({ emails, tokens, magic }; encrypted under AUTH_KEY)
  *   <slug>/config.json       — site config (also the existence marker)
  *   <slug>/<filename>        — a file, where <filename> is a validated human-readable name
+ *   <slug>/.versions/<id>.json — immutable history of <slug>/config.json (see 'config.json
+ *                              version history' below); never listed as a site file
  *
  * File keys are validated filenames (not opaque tokens). The client encodes local
  * paths to flat filenames by replacing / with - and sanitizing extensions. The
@@ -56,6 +58,10 @@ import { scheduled as sendNotificationsCron, getGoogleAccessToken } from './noti
  *   Legacy aliases (kept for backward compatibility):
  *   GET  /sites/list               — same as GET /sites
  *   GET  /sites/:slug/list         — same as GET /sites/:slug
+ *
+ * CONFIG VERSIONS (editor- or admin-gated):
+ *   GET  /sites/:slug/versions     — newest-first history of <slug>/config.json
+ *   POST /sites/:slug/rollback/:id — restore version :id (saved as a NEW version)
  *
  * SITE CREATION (gated by an admin secret — see authorizeAdmin):
  *   POST /sites/:slug               — create a site and kick off magic-link login for the
@@ -294,6 +300,32 @@ export default {
       const slug = segments[1];
       if (!validateSlug(slug)) return new Response('Invalid slug', { status: 400 });
       return listFiles(env, slug);
+    }
+
+    // GET /sites/:slug/versions — newest-first history of the slug's config.json
+    // (editor/admin-gated). Reading one version is a plain public GET on its `url`.
+    if (method === 'GET' && segments.length === 3 && segments[2] === 'versions') {
+      const slug = segments[1];
+      if (!validateSlug(slug)) return new Response('Invalid slug', { status: 400 });
+
+      const auth = await authorizeAdminOrEditor(env, slug, request);
+      if (!auth.ok) return Response.json({ error: auth.error }, { status: auth.status });
+
+      return listVersions(env, slug, url);
+    }
+
+    // POST /sites/:slug/rollback/:id — restore a previous config.json version. The old
+    // content is written as a NEW version (history is never rewritten or deleted).
+    if (method === 'POST' && segments.length === 4 && segments[2] === 'rollback') {
+      const slug = segments[1];
+      if (!validateSlug(slug)) return new Response('Invalid slug', { status: 400 });
+      const id = segments[3];
+      if (!VERSION_ID_RE.test(id)) return new Response('Invalid version id', { status: 400 });
+
+      const auth = await authorizeAdminOrEditor(env, slug, request);
+      if (!auth.ok) return Response.json({ error: auth.error }, { status: auth.status });
+
+      return rollbackConfig(ctx, env, slug, id);
     }
 
     // POST /sites/:slug — create a site (gated by admin secret OR any editor token)
@@ -1214,6 +1246,13 @@ export const CACHE_IMMUTABLE = 'public, max-age=31536000, immutable';
 export const CACHE_REVALIDATE = 'public, max-age=0, must-revalidate';
 export const LIVING_FILES = new Set(['config.json', 'slugs.json']);
 
+// config.json version history (see 'config.json version history' below). Versions live
+// under a dot-directory, which is outside the token charset, so clients can never
+// write them directly and listFiles()/cloneSite() can tell them apart.
+export const VERSIONS_DIR = '.versions/';
+export const VERSION_ID_RE = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z$/;
+export const DEFAULT_VERSION_LIMIT = 200; // GET /sites/:slug/versions page size (max 1000)
+
 // Request-body size caps. JSON/patch bodies are read into memory before parsing
 // (a giant body is a memory/CPU abuse vector). The PUT path enforces a
 // Content-Length pre-check; the body itself is streamed straight into R2.
@@ -1382,9 +1421,7 @@ async function createSite(ctx, env, slug, email) {
     );
   }
   const templateText = await template.text();
-  await env.CONTENT.put(`${slug}/config.json`, templateText, {
-    httpMetadata: { contentType: 'application/json', cacheControl: CACHE_REVALIDATE },
-  });
+  await writeConfig(env, slug, templateText, 'application/json'); // also the first history entry
 
   // Auto-build: a freshly-created site should build right away. Placed right after
   // the config seed so it fires even if a later step (email/marker/slugs.json)
@@ -1560,6 +1597,7 @@ async function cloneSite(ctx, env, sourceSlug, request) {
     const listed = await env.CONTENT.list({ limit: 1000, cursor, prefix });
     for (const obj of listed.objects) {
       const filename = obj.key.slice(prefix.length);
+      if (filename.startsWith(VERSIONS_DIR)) continue; // history stays with the source site
       const sourceKey = obj.key;
 
       const sourceObj = await env.CONTENT.get(sourceKey);
@@ -1578,10 +1616,15 @@ async function cloneSite(ctx, env, sourceSlug, request) {
         bodyContent = new TextEncoder().encode(text).buffer;
       }
 
-      const cacheControl = LIVING_FILES.has(filename) ? CACHE_REVALIDATE : CACHE_IMMUTABLE;
-      await env.CONTENT.put(`${targetSlug}/${filename}`, bodyContent, {
-        httpMetadata: { contentType, cacheControl },
-      });
+      if (filename === 'config.json') {
+        // The clone starts its own history with the (URL-rewritten) config.json.
+        await writeConfig(env, targetSlug, new TextDecoder().decode(bodyContent), contentType);
+      } else {
+        const cacheControl = LIVING_FILES.has(filename) ? CACHE_REVALIDATE : CACHE_IMMUTABLE;
+        await env.CONTENT.put(`${targetSlug}/${filename}`, bodyContent, {
+          httpMetadata: { contentType, cacheControl },
+        });
+      }
       copied += 1;
     }
     cursor = listed.truncated ? listed.cursor : undefined;
@@ -2236,6 +2279,7 @@ async function listFiles(env, slug) {
     const listed = await env.CONTENT.list({ limit: 1000, cursor, prefix });
     for (const o of listed.objects) {
       const token = o.key.slice(prefix.length); // strip "<slug>/"
+      if (token.startsWith(VERSIONS_DIR)) continue; // config.json history is not a site file
       files.push(fileUrl(env, slug, token));
     }
     cursor = listed.truncated ? listed.cursor : undefined;
@@ -2276,9 +2320,15 @@ async function putFile(ctx, env, slug, token, request) {
     doc = await updateSubscribedTo(doc, env, { slug });
     bodyToWrite = JSON.stringify(doc, null, 2) + '\n';
   }
-  await env.CONTENT.put(key, bodyToWrite, {
-    httpMetadata: { contentType, cacheControl },
-  });
+  let version;
+  if (isConfig) {
+    // Immutable history copy first, then the live config.json (see writeConfig).
+    version = await writeConfig(env, slug, bodyToWrite, contentType);
+  } else {
+    await env.CONTENT.put(key, bodyToWrite, {
+      httpMetadata: { contentType, cacheControl },
+    });
+  }
   // Auto-build: whenever a site's config.json is saved, trigger a page build
   // (best-effort, fire-and-forget via waitUntil so the save is never blocked or
   // failed by a dispatch problem).
@@ -2286,8 +2336,12 @@ async function putFile(ctx, env, slug, token, request) {
     ctx.waitUntil(githubDispatch(env, slug));
   }
   // `url` is the absolute public URL of the stored file, so a client that just
-  // uploaded media can use it directly as the field value.
-  return Response.json({ ok: true, slug, key, url: fileUrl(env, slug, token) }, { status: 200 });
+  // uploaded media can use it directly as the field value. A config.json write also
+  // returns `version`, the id of the history entry it created.
+  return Response.json(
+    { ok: true, slug, key, url: fileUrl(env, slug, token), ...(version ? { version } : {}) },
+    { status: 200 },
+  );
 }
 
 // PATCH /sites/:slug/config.json — apply a small diff to the stored config.json.
@@ -2329,12 +2383,102 @@ async function patchConfigFile(ctx, env, slug, request) {
   let { data, skipped } = applyPatch(doc, body.ops);
   data = await updateSubscribedTo(data, env, { slug }); // opus-youtube: sync subscriptions
   const text = JSON.stringify(data, null, 2) + '\n';
-  await env.CONTENT.put(key, text, {
-    httpMetadata: { contentType: 'application/json; charset=utf-8', cacheControl: CACHE_REVALIDATE },
-  });
+  const version = await writeConfig(env, slug, text);
   // Auto-build: same as a config.json PUT (best-effort, fire-and-forget).
   if (ctx?.waitUntil) ctx.waitUntil(githubDispatch(env, slug));
-  return Response.json({ ok: true, slug, key, data, skipped }, { status: 200 });
+  return Response.json({ ok: true, slug, key, data, skipped, version }, { status: 200 });
+}
+
+// --- config.json version history ---
+//
+// Every write of a site's config.json (PUT, PATCH, rollback, site creation, clone) goes
+// through writeConfig(): an immutable, timestamped copy is stored FIRST at
+// <slug>/.versions/<id>.json, and only then is <slug>/config.json overwritten as the
+// 'latest' object. If the second put fails the version still exists and the next save
+// repairs 'latest'. Every slug has its own history (prefix <slug>/.versions/).
+//
+// Version keys contain a dot-directory, which is outside the token charset
+// (FILENAME_RE), so PUT/DELETE /sites/:slug/:token can never write, overwrite or delete
+// them. They are public-read like the rest of the bucket
+// (https://data.parroquia.app/<slug>/.versions/<id>.json), so there is deliberately no
+// 'read one version' endpoint. listFiles() and cloneSite() skip them; deleteSite()
+// removes them with the rest of the slug.
+
+function versionKey(slug, id) {
+  return `${slug}/${VERSIONS_DIR}${id}.json`;
+}
+
+// Key-safe UTC timestamp: 2026-11-27T10:15:30.123Z becomes 2026-11-27T10-15-30-123Z.
+// Fixed width, so R2's lexicographic listing order is chronological order.
+function newVersionId(now = new Date()) {
+  return now.toISOString().replace(/[:.]/g, '-');
+}
+
+// Inverse of newVersionId: back to a normal ISO-8601 string for API consumers.
+function versionTimestamp(id) {
+  return id.replace(/T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z$/, 'T$1:$2:$3.$4Z');
+}
+
+// Version first, 'latest' second. Returns the new version id.
+async function writeConfig(env, slug, text, contentType = 'application/json; charset=utf-8') {
+  const id = newVersionId();
+  await env.CONTENT.put(versionKey(slug, id), text, {
+    httpMetadata: { contentType, cacheControl: CACHE_IMMUTABLE },
+  });
+  await env.CONTENT.put(`${slug}/config.json`, text, {
+    httpMetadata: { contentType, cacheControl: CACHE_REVALIDATE },
+  });
+  return id;
+}
+
+// GET /sites/:slug/versions — newest-first history of the slug's config.json.
+// Optional ?limit=N (default DEFAULT_VERSION_LIMIT, max 1000). Each entry's `url` is the
+// public, immutable copy on the data host.
+async function listVersions(env, slug, url) {
+  const prefix = `${slug}/${VERSIONS_DIR}`;
+  const versions = [];
+  let cursor;
+  do {
+    const listed = await env.CONTENT.list({ limit: 1000, cursor, prefix });
+    for (const o of listed.objects) {
+      const name = o.key.slice(prefix.length);
+      if (!name.endsWith('.json')) continue;
+      const id = name.slice(0, -'.json'.length);
+      if (!VERSION_ID_RE.test(id)) continue;
+      versions.push({
+        id,
+        timestamp: versionTimestamp(id),
+        size: o.size,
+        url: `${dataBase(env)}/${o.key}`,
+      });
+    }
+    cursor = listed.truncated ? listed.cursor : undefined;
+  } while (cursor);
+  versions.reverse(); // R2 lists in key order, i.e. oldest first
+  const asked = parseInt(url.searchParams.get('limit'), 10);
+  const limit = Number.isNaN(asked) ? DEFAULT_VERSION_LIMIT : Math.min(Math.max(asked, 1), 1000);
+  return Response.json({ slug, total: versions.length, versions: versions.slice(0, limit) });
+}
+
+// POST /sites/:slug/rollback/:id — restore a previous version. The old content is
+// written as a NEW version (and as the live config.json), so a rollback can itself be
+// rolled back and history is never rewritten. Returns the restored doc so the editor
+// can adopt it, like PATCH does.
+async function rollbackConfig(ctx, env, slug, id) {
+  const old = await env.CONTENT.get(versionKey(slug, id));
+  if (!old) return Response.json({ ok: false, error: 'version not found' }, { status: 404 });
+  let doc;
+  try {
+    doc = JSON.parse(await old.text());
+  } catch {
+    return Response.json({ ok: false, error: 'Stored version is invalid JSON' }, { status: 500 });
+  }
+  doc = await updateSubscribedTo(doc, env, { slug }); // same post-processing as a normal save
+  const text = JSON.stringify(doc, null, 2) + '\n';
+  const version = await writeConfig(env, slug, text);
+  // Auto-build, like any other config.json write (best-effort, fire-and-forget).
+  if (ctx?.waitUntil) ctx.waitUntil(githubDispatch(env, slug));
+  return Response.json({ ok: true, slug, restored: id, version, data: doc }, { status: 200 });
 }
 
 // Admin-gated maintenance: rewrite every object's httpMetadata.cacheControl so the
@@ -2350,7 +2494,8 @@ async function backfillCache(env) {
     const listed = await env.CONTENT.list({ cursor, limit: 1000 });
     for (const obj of listed.objects) {
       const key = obj.key;
-      if (key === AUTH_FILE) {
+      // auth.enc is private; config.json history objects are already immutable.
+      if (key === AUTH_FILE || key.includes(`/${VERSIONS_DIR}`)) {
         skipped += 1;
         continue;
       }

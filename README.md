@@ -55,7 +55,9 @@ the code ever disagree, **the code wins** and this README must be corrected.
 | DELETE | `/sites/:slug`          | `Bearer admin`  | — delete a site entirely: best-effort Cloudflare resource cleanup, then remove all R2 content, clean up auth.enc grants/tokens/magic, re-scan slugs.json | `200 { ok, slug, filesDeleted, cfWarnings? }` / `400/401/403/404/503` |
 | POST   | `/api/fcm/token`       | —               | body `{ "token": "<fcm-token>", "site": "<slug>" }` — subscribe the FCM registration token to the site's topic (topic = `site`). Open to all. Uses `FCM_SERVER_KEY` Worker secret, which is also used by the [daily cron](#fcm-notifications) to send topic messages for tomorrow's calendar events. | `200 { ok: true }` / `400` |
 | PUT    | `/sites/:slug/:token`    | `Bearer editor | admin` | body = raw bytes, `Content-Type` optional. Writing `config.json` also triggers an automatic page build (best-effort, see [Auto-build](#auto-build)) | `200 { ok, slug, key }` / `400/401/403` |
-| PATCH  | `/sites/:slug/config.json` | `Bearer editor` | body `{ "ops": [...] }` — apply a small **diff** onto the currently stored `config.json` and return the merged doc (used by the editor for small, per-field, last-edit-wins concurrent saves; see [Patch saves](#patch-saves)). Also triggers an automatic page build | `200 { ok, slug, key, data, skipped }` / `400/401/403/404/500` |
+| PATCH  | `/sites/:slug/config.json` | `Bearer editor` | body `{ "ops": [...] }` — apply a small **diff** onto the currently stored `config.json` and return the merged doc (used by the editor for small, per-field, last-edit-wins concurrent saves; see [Patch saves](#patch-saves)). Also triggers an automatic page build | `200 { ok, slug, key, data, skipped, version }` / `400/401/403/404/500` |
+| GET    | `/sites/:slug/versions`  | `Bearer editor | admin` | `:slug` validated; optional `?limit=N` (default 200, max 1000) — newest-first history of the slug's `config.json` (see [Config versions](#config-versions)). Each entry's `url` is the public, immutable copy on the data host | `200 { slug, total, versions: [{ id, timestamp, size, url }] }` / `400/401/403` |
+| POST   | `/sites/:slug/rollback/:id` | `Bearer editor | admin` | `:id` = a version `id` from the list — restore it. The old content is saved as a **new** version and as the live `config.json` (history is never rewritten); also triggers an automatic page build | `200 { ok, slug, restored, version, data }` / `400/401/403/404/500` |
 | DELETE | `/sites/:slug/:token`    | `Bearer editor | admin` | —                                                  | `200 { ok, slug, key }` / `400/401/403` |
 
 **Reserved slugs** (rejected on site creation and cloning): `api`, `editor`, `www`, `data`.
@@ -324,6 +326,8 @@ auth.enc                  ALL credential state in ONE AES-GCM-256 encrypted blob
                           "magic":  { "<sha256(code)>":   { slug, email, exp } } })
 <slug>/.site              existence marker (outside token charset, un-writable by clients)
 <slug>/<filename>         content file (validated flat filename)
+<slug>/.versions/<id>.json  one immutable entry of <slug>/config.json's history (un-writable by
+                          clients; see Config versions)
 slugs.json                { "slugs": [...] }  written on site creation
 ```
 
@@ -370,6 +374,35 @@ are follow-ups in the **editor** repo.
 **Deploy prerequisite:** before creating any site, put a default `config.json` at
 the **bucket root** — `createSite` copies it into every new site and returns `503`
 if it is missing.
+
+## Config versions
+
+Every write of a site's `config.json` (`PUT`, `PATCH`, a rollback, site creation's
+seeded template, and a clone's copied config) keeps an immutable copy at
+`<slug>/.versions/<id>.json`. Each slug has its own history.
+
+- **`<id>`** is the write's UTC timestamp made key-safe: `2026-11-27T10:15:30.123Z`
+  becomes `2026-11-27T10-15-30-123Z`. Fixed width, so R2's listing order is
+  chronological. The list endpoint also returns it as a normal ISO `timestamp`.
+- **Write order**: version first, then the live `config.json`. If the second put fails
+  the version still exists and the next save repairs the live file. Readers always read
+  `config.json` as before; nothing changes for the build or the editor.
+- **Reading a version** is a plain public GET on its `url`
+  (`https://data.parroquia.app/<slug>/.versions/<id>.json`), so there is no
+  `GET /sites/:slug/versions/:id`.
+- **Listing**: `GET /sites/:slug/versions` (editor/admin) returns `{ slug, total,
+  versions: [{ id, timestamp, size, url }] }`, newest first. `?limit=N` caps the page
+  (default 200, max 1000); `total` is always the full count.
+- **Rollback**: `POST /sites/:slug/rollback/:id` writes the old content as a **new**
+  version and as the live `config.json`, then triggers a build. History is never
+  rewritten or deleted, so a rollback can itself be rolled back. The response carries
+  the restored document in `data`, like `PATCH`.
+- **Not file routes**: version keys contain a dot-directory, outside the token charset,
+  so clients cannot write or delete them via `PUT`/`DELETE /sites/:slug/:token`.
+  `GET /sites/:slug` (the file list) skips them, a clone does not copy the source's
+  history (it starts its own), and deleting a site removes them with the rest.
+- **Not implemented yet**: pruning/lifecycle of old versions, deduping unchanged saves,
+  and the author of each version.
 
 ## Patch saves
 
