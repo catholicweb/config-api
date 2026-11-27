@@ -127,6 +127,34 @@ describe('POST /api/register', () => {
     expect((await call(env, ctx, 'POST', '/api/register', payload({ email: 'ANA@example.com' }))).status).toBe(429);
   });
 
+  it('brands the confirmation with the site\'s own name, colour and icon', async () => {
+    const { r2, env, ctx } = await setup();
+    await r2.put('demo/config.json', JSON.stringify({ info: { title: 'Parroquia San Miguel' }, theme: { accentHue: 30, icon: 'https://data.parroquia.app/demo/icon.png' } }));
+    expect((await call(env, ctx, 'POST', '/api/register', payload())).status).toBe(201);
+    expect(sent[0].from).toBe('Parroquia San Miguel <no-reply@parroquia.app>');
+    expect(sent[0].html).toContain('src="https://data.parroquia.app/demo/icon.png"');
+    expect(sent[0].html).toContain('Parroquia San Miguel');
+    expect(sent[0].html).not.toContain('Parroquia App');
+    expect(sent[0].html).not.toContain('#0066cc');
+    expect(sent[0].text).toContain('Parroquia San Miguel');
+  });
+
+  it('falls back to the slug name and an initial tile when the config has no branding', async () => {
+    const { env, ctx } = await setup();
+    await call(env, ctx, 'POST', '/api/register', payload());
+    expect(sent[0].from).toBe('Demo <no-reply@parroquia.app>');
+    expect(sent[0].html).not.toContain('<img');
+    expect(sent[0].html).not.toContain('Parroquia App');
+  });
+
+  it('never takes branding from the request body', async () => {
+    const { env, ctx } = await setup();
+    await call(env, ctx, 'POST', '/api/register', payload({ brand: { name: 'Evil' }, brandName: 'Evil', iconUrl: 'https://evil.example/x.png', accentHue: 10 }));
+    expect(sent[0].from).toBe('Demo <no-reply@parroquia.app>');
+    expect(sent[0].html).not.toContain('evil.example');
+    expect(sent[0].html).not.toContain('Evil');
+  });
+
   it('never links the email to a host that is not the site\'s own', async () => {
     const { env, ctx } = await setup();
     await call(env, ctx, 'POST', '/api/register', payload({ pageUrl: 'https://evil.example/phish' }));

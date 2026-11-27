@@ -45,6 +45,17 @@ own hosts (`<slug>.parroquia.app`, the host of `config.json` `dev.siteurl`, or `
 Secret: `TURNSTILE_SECRET` (fails closed with 503 when unset). Every one of those hosts must be listed in the
 widget's domains in Cloudflare. The widget is explicitly rendered with `data-action="register"` by web-template.
 
+## Confirmation email branding
+
+The confirmation sent to the visitor wears the **site's own branding**: sender display name, logo and
+button colour come from the slug's `config.json` (`info.title`, `theme.icon` (or `icon`), `theme.accentHue`),
+read server-side in the same R2 read that resolves the allowed hostnames. Fallbacks: the slug as a title,
+an initial on the accent colour when there is no usable icon (absolute `https`, not SVG), hue 200. The
+sender address stays `no-reply@parroquia.app` (SPF/DKIM), only the display name changes. Branding is
+**never** accepted from the request body: the endpoint is open and mails a caller-chosen address.
+Emails to editors (magic links, organizer notifications, stats) keep the Parroquia App branding.
+Code: `src/branding.js`.
+
 ## Other protections
 
 Honeypot field `website`; max 5 registrations per email per hour; field-length caps; `consent: true` required;
