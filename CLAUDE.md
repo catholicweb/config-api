@@ -68,6 +68,9 @@ Request flow, in order:
    - `PUT`/`DELETE /sites/:slug/:token` — editor-gated writes (`putFile`/`deleteFile`)
    - `PATCH /sites/:slug/config.json` — editor-gated small diff apply onto the
      stored `config.json` (`patchConfigFile`); scoped to `config.json` only
+   - `GET /sites/:slug/versions` — editor-gated, newest-first `config.json` history
+     (`listVersions`); `POST /sites/:slug/rollback/:id` — restore a version as a NEW
+     version (`rollbackConfig`)
 
 Key helper groups (each has a `// ---` banner comment):
 - **Validation** — `validateFilename`, `validateSlug`, `validateToken`,
@@ -129,6 +132,14 @@ Key helper groups (each has a `// ---` banner comment):
 
 ## Notable behaviors
 
+- **Config version history** — every `config.json` write (PUT, PATCH, rollback,
+  createSite seed, clone) goes through `writeConfig()`: an immutable copy at
+  `<slug>/.versions/<id>.json` (`<id>` = key-safe UTC timestamp) is put FIRST, then
+  the live `<slug>/config.json`. Never write `config.json` with a bare
+  `env.CONTENT.put` or the write is not versioned. The dot-directory is outside the
+  token charset (clients can't write it); `listFiles` and `cloneSite` skip
+  `VERSIONS_DIR`, `backfillCache` skips version objects. No `GET /versions/:id` — the
+  bucket is public, so each entry's `url` is read directly. See README "Config versions".
 - **Caching** — every `env.CONTENT.put` sets `httpMetadata.cacheControl` from the
   `CACHE_*` constants: hashed media gets `public, max-age=31536000, immutable`, and
   `LIVING_FILES` (`config.json`, `slugs.json`) get `public, max-age=0, must-revalidate`.
