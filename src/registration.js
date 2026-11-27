@@ -37,6 +37,7 @@ import {
   toHex,
 } from './index.js';
 import { notifySubscribers } from './registration-notify.js';
+import { DEFAULT_BRAND, siteBranding, brandedFrom } from './branding.js';
 
 export const REG_ACTION = 'register';
 export const TURNSTILE_VERIFY_URL = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
@@ -131,22 +132,30 @@ export async function emailDigest(keys, email) {
 // Turnstile
 // ---------------------------------------------------------------------------
 
+// The site's parsed config.json, or null when missing/unreadable.
+export async function loadSiteConfig(env, slug) {
+  try {
+    const obj = await env.CONTENT.get(`${slug}/config.json`);
+    return obj ? JSON.parse(await obj.text()) : null;
+  } catch {
+    return null;
+  }
+}
+
 // Frontend hostnames allowed to have produced a Turnstile token (and to be
 // linked from the confirmation email) for this site: its parroquia.app
 // subdomain, the host of its own `dev.siteurl` (custom domain), plus any
 // comma-separated TURNSTILE_HOSTNAMES. Only put localhost/127.0.0.1 in
 // TURNSTILE_HOSTNAMES for local dev (.dev.vars), never in production.
-export async function allowedHostnames(env, slug) {
+export async function allowedHostnames(env, slug, loadedConfig) {
   const hosts = new Set([`${slug}.parroquia.app`]);
   try {
-    const obj = await env.CONTENT.get(`${slug}/config.json`);
-    if (obj) {
-      const cfg = JSON.parse(await obj.text());
-      const siteurl = cfg?.dev?.siteurl;
-      if (typeof siteurl === 'string' && siteurl) {
-        const u = new URL(/^https?:\/\//i.test(siteurl) ? siteurl : `https://${siteurl}`);
-        if (u.hostname) hosts.add(u.hostname.toLowerCase());
-      }
+    // `loadedConfig` lets the caller share one config.json read (undefined = read it here).
+    const cfg = loadedConfig !== undefined ? loadedConfig : await loadSiteConfig(env, slug);
+    const siteurl = cfg?.dev?.siteurl;
+    if (typeof siteurl === 'string' && siteurl) {
+      const u = new URL(/^https?:\/\//i.test(siteurl) ? siteurl : `https://${siteurl}`);
+      if (u.hostname) hosts.add(u.hostname.toLowerCase());
     }
   } catch {
     /* unreadable config: keep the default subdomain only */
@@ -259,7 +268,16 @@ const STRINGS = {
   },
 };
 
-export function buildEmail(lang, { eventLabel, fields, link }) {
+// Logo (or an initial on the accent colour when the site has no usable icon) + site name.
+function brandHeader(brand) {
+  const initial = esc(Array.from(brand.name)[0]?.toUpperCase() || 'P');
+  const logo = brand.iconUrl
+    ? `<img src="${esc(brand.iconUrl)}" width="40" height="40" alt="" style="display:block;width:40px;height:40px;border-radius:8px;object-fit:cover;">`
+    : `<div style="width:40px;height:40px;line-height:40px;border-radius:8px;background:${esc(brand.color)};color:#fff;text-align:center;font-size:20px;font-weight:bold;">${initial}</div>`;
+  return `<table cellpadding="0" cellspacing="0" style="margin:0 0 24px;"><tr><td style="padding-right:12px;vertical-align:middle;">${logo}</td><td style="vertical-align:middle;font-size:18px;font-weight:bold;color:#1a1a1a;">${esc(brand.name)}</td></tr></table>`;
+}
+
+export function buildEmail(lang, { eventLabel, fields, link, brand = DEFAULT_BRAND }) {
   const answer = (v, en) => (v === true ? (en ? 'Yes' : 'Sí') : v === false ? 'No' : String(v));
   const t = STRINGS[String(lang || '').toLowerCase().startsWith('en') ? 'en' : 'es'];
   const rows = [
@@ -269,30 +287,32 @@ export function buildEmail(lang, { eventLabel, fields, link }) {
   ];
   const text = `${t.hello(fields.name)}\n\n${t.intro}\n\n`
     + rows.map(([k, v]) => `${k}: ${v}`).join('\n')
-    + `\n\n${t.edit}\n${link}\n\n${t.ignore}`;
+    + `\n\n${t.edit}\n${link}\n\n${t.ignore}\n\n— ${brand.name}`;
   const html = `<!DOCTYPE html><html><body style="margin:0;padding:0;background:#f5f5f5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
 <table width="100%" cellpadding="0" cellspacing="0"><tr><td align="center">
-<table width="600" cellpadding="0" cellspacing="0" style="background:#fff;border-radius:8px;margin:24px 16px;padding:32px 24px;"><tr><td>
+<table width="600" cellpadding="0" cellspacing="0" style="background:#fff;border-radius:8px;border-top:4px solid ${esc(brand.color)};margin:24px 16px;padding:32px 24px;"><tr><td>
+${brandHeader(brand)}
 <p style="margin:0 0 12px;color:#1a1a1a;font-size:16px;">${esc(t.hello(fields.name))}</p>
 <p style="margin:0 0 16px;color:#444;font-size:16px;">${esc(t.intro)}</p>
 <table cellpadding="6" cellspacing="0" style="margin:0 0 20px;font-size:15px;color:#333;">${rows
     .map(([k, v]) => `<tr><td style="color:#888;vertical-align:top;">${esc(k)}</td><td style="white-space:pre-wrap;">${esc(v)}</td></tr>`)
     .join('')}</table>
 <p style="margin:0 0 12px;color:#444;font-size:15px;">${esc(t.edit)}</p>
-<p style="margin:0 0 20px;"><a href="${esc(link)}" style="display:inline-block;padding:12px 24px;background:#0066cc;color:#fff;text-decoration:none;border-radius:6px;font-weight:bold;">${esc(t.button)}</a></p>
+<p style="margin:0 0 20px;"><a href="${esc(link)}" style="display:inline-block;padding:12px 24px;background:${esc(brand.color)};color:#fff;text-decoration:none;border-radius:6px;font-weight:bold;">${esc(t.button)}</a></p>
 <p style="margin:0;color:#888;font-size:13px;">${esc(t.ignore)}</p>
 </td></tr></table></td></tr></table></body></html>`;
   return { subject: t.subject(eventLabel), text, html };
 }
 
-export async function sendRegistrationEmail(env, to, mail) {
+// `brand` (from siteBranding) sets the sender name; without it the default Parroquia App sender is used.
+export async function sendRegistrationEmail(env, to, mail, brand) {
   if (!env.RESEND_API_KEY) return { ok: false, error: 'RESEND_API_KEY not configured' };
   try {
     const res = await fetch('https://api.resend.com/emails', {
       method: 'POST',
       headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        from: env.FROM_EMAIL || 'Parroquia App <no-reply@parroquia.app>',
+        from: brand ? brandedFrom(env, brand) : env.FROM_EMAIL || 'Parroquia App <no-reply@parroquia.app>',
         to,
         subject: mail.subject,
         text: mail.text,
@@ -355,7 +375,8 @@ async function createRegistration(env, request, ctx) {
 
   if (!(await siteExists(env, slug))) return json({ error: 'unknown site' }, 404);
 
-  const hostnames = await allowedHostnames(env, slug);
+  const cfg = await loadSiteConfig(env, slug); // one read: hostnames + branding
+  const hostnames = await allowedHostnames(env, slug, cfg);
   const ip = request.headers.get('CF-Connecting-IP') || '';
   const captcha = await verifyTurnstile(env, d.turnstile, ip, hostnames);
   if (!captcha.ok) return json({ error: captcha.error }, captcha.status);
@@ -382,7 +403,10 @@ async function createRegistration(env, request, ctx) {
     .run();
 
   const link = editLink(d.pageUrl, slug, hostnames, id, secret);
-  const sent = await sendRegistrationEmail(env, fields.email, buildEmail(lang, { eventLabel, fields, link }));
+  // The visitor's confirmation wears the site's own branding (read from its config.json, never
+  // from the request); emails to editors keep the Parroquia App branding.
+  const brand = siteBranding(cfg, slug);
+  const sent = await sendRegistrationEmail(env, fields.email, buildEmail(lang, { eventLabel, fields, link, brand }), brand);
   if (!sent.ok) console.error('registration: confirmation email failed:', sent.error);
   later(ctx, notifySubscribers(env, slug, 'new', { eventKey: d.event, eventLabel, fields }));
   return json({ ok: true, id, emailSent: sent.ok }, 201);
