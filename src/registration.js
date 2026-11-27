@@ -305,24 +305,35 @@ ${brandHeader(brand)}
 }
 
 // `brand` (from siteBranding) sets the sender name; without it the default Parroquia App sender is used.
+// A transient failure (network error, 429, 5xx) is retried once; the same Idempotency-Key makes
+// sure a retry after a lost response cannot deliver two emails. Never throws.
 export async function sendRegistrationEmail(env, to, mail, brand) {
   if (!env.RESEND_API_KEY) return { ok: false, error: 'RESEND_API_KEY not configured' };
-  try {
-    const res = await fetch('https://api.resend.com/emails', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        from: brand ? brandedFrom(env, brand) : env.FROM_EMAIL || 'Parroquia App <no-reply@parroquia.app>',
-        to,
-        subject: mail.subject,
-        text: mail.text,
-        html: mail.html,
-      }),
-    });
-    return res.ok ? { ok: true } : { ok: false, error: `Resend ${res.status}` };
-  } catch (e) {
-    return { ok: false, error: e.message };
+  const body = JSON.stringify({
+    from: brand ? brandedFrom(env, brand) : env.FROM_EMAIL || 'Parroquia App <no-reply@parroquia.app>',
+    to,
+    subject: mail.subject,
+    text: mail.text,
+    html: mail.html,
+  });
+  const headers = {
+    Authorization: `Bearer ${env.RESEND_API_KEY}`,
+    'Content-Type': 'application/json',
+    'Idempotency-Key': crypto.randomUUID(),
+  };
+  let error = 'unknown';
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt) await new Promise((r) => setTimeout(r, 250));
+    try {
+      const res = await fetch('https://api.resend.com/emails', { method: 'POST', headers, body });
+      if (res.ok) return { ok: true };
+      error = `Resend ${res.status}`;
+      if (res.status !== 429 && res.status < 500) break; // permanent (bad domain, bad address...)
+    } catch (e) {
+      error = e.message;
+    }
   }
+  return { ok: false, error };
 }
 
 // Edit link base: the page the visitor registered from, but only when its host
@@ -366,8 +377,9 @@ async function createRegistration(env, request, ctx) {
   const checked = validateFields(d);
   if (!checked.ok) return json({ error: checked.error }, 400);
   if (d.consent !== true) return json({ error: 'consent is required' }, 400);
-  // Honeypot: real visitors never fill it in. Pretend success to the bot.
-  if (typeof d.website === 'string' && d.website) return json({ ok: true }, 200);
+  // Honeypot: real visitors never fill it in. Rejected visibly, never with a fake success: a password
+  // manager or autofill can fill a hidden field, and that person must not be told they are registered.
+  if (typeof d.website === 'string' && d.website) return json({ error: 'rejected' }, 400);
 
   if (!db(env)) return json({ error: 'registrations not configured' }, 503);
   const keys = await siteKeys(env, slug);
@@ -395,12 +407,27 @@ async function createRegistration(env, request, ctx) {
   const eventLabel = str(d.eventLabel, LIMITS.label) || d.event;
   const lang = str(d.lang, 12);
   const sealed = await seal(keys, slug, id, { ...fields, lang });
-  await db(env)
-    .prepare(
-      'INSERT INTO registrations (id, site, event_key, event_label, people, email_hmac, secret_hash, iv, data, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
-    )
-    .bind(id, slug, d.event, eventLabel, fields.people, mac, await sha256Hex(secret), sealed.iv, sealed.data, now, now)
-    .run();
+  // Never store something we could not read back (wrong/rotated key, crypto fault).
+  const check = await open(keys, slug, id, sealed).catch(() => null);
+  if (!check || check.email !== fields.email) {
+    console.error('registration: sealed data does not round-trip, nothing stored');
+    return json({ error: 'could not save registration' }, 500);
+  }
+  // The visitor is only told "registered" after the row is confirmed: exactly one row written AND read back.
+  let saved = false;
+  try {
+    const r = await db(env)
+      .prepare(
+        'INSERT INTO registrations (id, site, event_key, event_label, people, email_hmac, secret_hash, iv, data, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+      )
+      .bind(id, slug, d.event, eventLabel, fields.people, mac, await sha256Hex(secret), sealed.iv, sealed.data, now, now)
+      .run();
+    saved = r?.success !== false && Number(r?.meta?.changes) === 1;
+    if (saved) saved = !!(await db(env).prepare('SELECT id FROM registrations WHERE id = ?').bind(id).first());
+  } catch (e) {
+    console.error('registration: insert failed:', e?.message);
+  }
+  if (!saved) return json({ error: 'could not save registration' }, 500);
 
   const link = editLink(d.pageUrl, slug, hostnames, id, secret);
   // The visitor's confirmation wears the site's own branding (read from its config.json, never
@@ -452,10 +479,14 @@ async function updateRegistration(env, id, request, ctx) {
   const prev = await open(keys, row.site, id, row);
   const f = checked.fields;
   const sealed = await seal(keys, row.site, id, { ...f, extra: f.extra ?? prev?.extra ?? [], lang: prev?.lang || '' });
-  await db(env)
+  const check = await open(keys, row.site, id, sealed).catch(() => null);
+  if (!check || check.email !== f.email) return json({ error: 'could not save registration' }, 500);
+  const r = await db(env)
     .prepare('UPDATE registrations SET people = ?, email_hmac = ?, iv = ?, data = ?, updated_at = ? WHERE id = ?')
     .bind(f.people, await emailDigest(keys, f.email), sealed.iv, sealed.data, Date.now(), id)
     .run();
+  // Saved only if a row really changed (it may have been purged or cancelled meanwhile).
+  if (r?.success === false || Number(r?.meta?.changes) !== 1) return json({ error: 'not found' }, 404);
   later(ctx, notifySubscribers(env, row.site, 'updated', { eventKey: row.event_key, eventLabel: row.event_label, fields: f }));
   return json({ ok: true });
 }
@@ -466,7 +497,8 @@ async function deleteRegistration(env, id, url, ctx) {
   // Read the data before it is gone, so the organizers can be told who cancelled.
   const keys = await siteKeys(env, row.site);
   const data = keys ? await open(keys, row.site, id, row) : null;
-  await db(env).prepare('DELETE FROM registrations WHERE id = ?').bind(row.id).run();
+  const r = await db(env).prepare('DELETE FROM registrations WHERE id = ?').bind(row.id).run();
+  if (r?.success === false || Number(r?.meta?.changes) !== 1) return json({ error: 'not found' }, 404);
   if (data) later(ctx, notifySubscribers(env, row.site, 'cancelled', { eventKey: row.event_key, eventLabel: row.event_label, fields: data }));
   return json({ ok: true });
 }
