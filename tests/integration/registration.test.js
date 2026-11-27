@@ -22,15 +22,19 @@ function makeD1() {
 
 const KEY = btoa(String.fromCharCode(...new Uint8Array(32).fill(7)));
 const GOOD = { success: true, action: 'register', hostname: 'demo.parroquia.app' };
-let turnstile, sent;
+let turnstile, sent, resendQueue; // resendQueue: statuses to answer the next Resend calls with
 
 function stubFetch() {
   turnstile = { ...GOOD };
   sent = [];
+  resendQueue = [];
   vi.stubGlobal('fetch', async (url, init) => {
     if (String(url).includes('turnstile')) return Response.json(turnstile);
     if (String(url).includes('resend')) {
       sent.push(JSON.parse(init.body));
+      const status = resendQueue.shift();
+      if (status === 'throw') throw new Error('network down');
+      if (status) return new Response('{}', { status });
       return Response.json({ id: 'x' });
     }
     throw new Error(`unexpected fetch ${url}`);
@@ -113,12 +117,14 @@ describe('POST /api/register', () => {
     }
   });
 
-  it('404s for an unknown site and silently drops honeypot hits', async () => {
+  it('404s for an unknown site and rejects honeypot hits visibly (never a fake success)', async () => {
     const { env, ctx } = await setup();
     expect((await call(env, ctx, 'POST', '/api/register', payload({ site: 'nope' }))).status).toBe(404);
     const res = await call(env, ctx, 'POST', '/api/register', payload({ website: 'http://spam' }));
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(400);
+    expect((await res.json()).ok).toBeUndefined();
     expect(env.REGDB._sqlite.prepare('SELECT COUNT(*) n FROM registrations').get().n).toBe(0);
+    expect(sent).toHaveLength(0);
   });
 
   it('rate-limits registrations per email address', async () => {
@@ -169,6 +175,134 @@ describe('POST /api/register', () => {
     const res = await call(env, ctx, 'POST', '/api/register', payload({ pageUrl: 'https://www.parroquiademo.org/evento/' }));
     expect(res.status).toBe(201);
     expect(sent[0].text).toContain('https://www.parroquiademo.org/evento/?edit=');
+  });
+});
+
+// Wrap D1 so statements matching `match` run `override` instead (run/first).
+function intercept(env, match, override) {
+  const real = env.REGDB;
+  env.REGDB = {
+    _sqlite: real._sqlite,
+    prepare: (sql) => {
+      const wrap = (stmt) => ({
+        bind: (...a) => wrap(stmt.bind(...a)),
+        first: (...a) => (match.test(sql) && override.first ? override.first() : stmt.first(...a)),
+        all: (...a) => stmt.all(...a),
+        run: (...a) => (match.test(sql) && override.run ? override.run() : stmt.run(...a)),
+      });
+      return wrap(real.prepare(sql));
+    },
+  };
+}
+const rowCount = (env) => env.REGDB._sqlite.prepare('SELECT COUNT(*) n FROM registrations').get().n;
+
+describe('a registration is never confirmed unless it was really saved', () => {
+  const INSERT = /INSERT INTO registrations/;
+
+  it('500s, sends no email and notifies nobody when the insert throws', async () => {
+    const { env, ctx } = await setup();
+    intercept(env, INSERT, { run: async () => { throw new Error('D1 down'); } });
+    const res = await call(env, ctx, 'POST', '/api/register', payload());
+    expect(res.status).toBe(500);
+    expect((await res.json()).ok).toBeUndefined();
+    expect(rowCount(env)).toBe(0);
+    expect(sent).toHaveLength(0);
+  });
+
+  it('500s when the insert reports no written row', async () => {
+    const { env, ctx } = await setup();
+    intercept(env, INSERT, { run: async () => ({ meta: { changes: 0 } }) });
+    const res = await call(env, ctx, 'POST', '/api/register', payload());
+    expect(res.status).toBe(500);
+    expect(sent).toHaveLength(0);
+  });
+
+  it('500s when the row cannot be read back after the insert', async () => {
+    const { env, ctx } = await setup();
+    intercept(env, /SELECT id FROM registrations WHERE id/, { first: async () => null });
+    const res = await call(env, ctx, 'POST', '/api/register', payload());
+    expect(res.status).toBe(500);
+    expect(sent).toHaveLength(0);
+  });
+
+  it('503s (no email, no row) when storage or the encryption key is missing', async () => {
+    const a = await setup();
+    delete a.env.REG_KEY;
+    expect((await call(a.env, a.ctx, 'POST', '/api/register', payload())).status).toBe(503);
+    expect(sent).toHaveLength(0);
+    const b = await setup();
+    delete b.env.REGDB;
+    expect((await call(b.env, b.ctx, 'POST', '/api/register', payload())).status).toBe(503);
+    expect(sent).toHaveLength(0);
+  });
+
+  it('retries a transient email failure once and reports emailSent true', async () => {
+    const { env, ctx } = await setup();
+    resendQueue = [500];
+    const out = await (await call(env, ctx, 'POST', '/api/register', payload())).json();
+    expect(out.emailSent).toBe(true);
+    expect(sent).toHaveLength(2);
+    resendQueue = ['throw'];
+    expect((await (await call(env, ctx, 'POST', '/api/register', payload({ email: 'b@example.com' }))).json()).emailSent).toBe(true);
+  });
+
+  it('keeps the registration but says so honestly when the email cannot be sent', async () => {
+    const { env, ctx } = await setup();
+    resendQueue = [500, 500];
+    const res = await call(env, ctx, 'POST', '/api/register', payload());
+    expect(res.status).toBe(201);
+    expect((await res.json()).emailSent).toBe(false);
+    expect(rowCount(env)).toBe(1);
+    expect(sent).toHaveLength(2);
+  });
+
+  it('does not retry a permanent email failure', async () => {
+    const { env, ctx } = await setup();
+    resendQueue = [403];
+    expect((await (await call(env, ctx, 'POST', '/api/register', payload())).json()).emailSent).toBe(false);
+    expect(sent).toHaveLength(1);
+    expect(rowCount(env)).toBe(1);
+  });
+
+  it('reports emailSent false when email is not configured, with the row saved', async () => {
+    const { env, ctx } = await setup();
+    delete env.RESEND_API_KEY;
+    const res = await call(env, ctx, 'POST', '/api/register', payload());
+    expect(res.status).toBe(201);
+    expect((await res.json()).emailSent).toBe(false);
+    expect(rowCount(env)).toBe(1);
+  });
+
+  async function created() {
+    const s = await setup();
+    await call(s.env, s.ctx, 'POST', '/api/register', payload());
+    const m = /edit=([0-9a-f]{32})\.([0-9a-f]{64})/.exec(sent[0].text);
+    return { ...s, id: m[1], k: m[2] };
+  }
+  const edit = (k, over = {}) => ({ k, name: 'Ana P.', phone: '600111222', email: 'ana@example.com', people: 15, notes: '', ...over });
+
+  it('an edit is not confirmed when no row was updated, and the data is unchanged', async () => {
+    const { env, ctx, id, k } = await created();
+    intercept(env, /UPDATE registrations/, { run: async () => ({ meta: { changes: 0 } }) });
+    const res = await call(env, ctx, 'PUT', `/api/register/${id}`, edit(k));
+    expect(res.status).toBe(404);
+    expect((await res.json()).ok).toBeUndefined();
+    const now = await (await call(env, ctx, 'GET', `/api/register/${id}?k=${k}`)).json();
+    expect(now).toMatchObject({ name: 'Ana Pérez', people: 12 });
+  });
+
+  it('an edit 500s when the update throws', async () => {
+    const { env, ctx, id, k } = await created();
+    intercept(env, /UPDATE registrations/, { run: async () => { throw new Error('D1 down'); } });
+    expect((await call(env, ctx, 'PUT', `/api/register/${id}`, edit(k))).status).toBe(500);
+  });
+
+  it('a cancellation is not confirmed when no row was deleted', async () => {
+    const { env, ctx, id, k } = await created();
+    intercept(env, /DELETE FROM registrations/, { run: async () => ({ meta: { changes: 0 } }) });
+    const res = await call(env, ctx, 'DELETE', `/api/register/${id}?k=${k}`);
+    expect(res.status).toBe(404);
+    expect(rowCount(env)).toBe(1);
   });
 });
 

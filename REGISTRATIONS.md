@@ -45,6 +45,17 @@ own hosts (`<slug>.parroquia.app`, the host of `config.json` `dev.siteurl`, or `
 Secret: `TURNSTILE_SECRET` (fails closed with 503 when unset). Every one of those hosts must be listed in the
 widget's domains in Cloudflare. The widget is explicitly rendered with `data-action="register"` by web-template.
 
+## Never a false confirmation
+
+A `201 { ok: true }` is returned only when the registration is really stored:
+the sealed data must decrypt again, the INSERT must report exactly one written row, and that row must be
+read back. Otherwise the visitor gets a `5xx` (and no email, no organizer notification). Edits and
+cancellations are confirmed only if a row actually changed (`404` otherwise). A honeypot hit gets a `400`,
+never a fake success (autofill can fill hidden fields). The confirmation email is retried once on transient
+failures; if it still fails the response is `201` with `emailSent: false`, and the form says the
+registration is saved but the email could not be sent. The form also requires `ok: true` (and an `id`)
+in the response before showing success.
+
 ## Confirmation email branding
 
 The confirmation sent to the visitor wears the **site's own branding**: sender display name, logo and
